@@ -1,0 +1,41 @@
+{
+  "defaults": {
+    "time_window_days": 14,
+    "max_commits": 20,
+    "activity_types": ["commits", "pulls", "issues", "releases"],
+    "ai_backend": {
+      "type": "claude-cli",
+      "timeout": 600
+    }
+  },
+  "groups": [
+    {
+      "name": "my-team",
+      "config_file": "groups/my-team.json"
+    },
+    {
+      "name": "my-other-team",
+      "sources": [
+        {
+          "type": "github",
+          "repositories": [
+            "owner/repo-1",
+            "owner/repo-2"
+          ]
+        }
+      ],
+      "team_context": {
+        "name": "My Other Team",
+        "focus_areas": [
+          "Feature area your team cares about",
+          "Another relevant technology or domain"
+        ],
+        "priorities": [
+          "Your team's top priority (shown first in AI summaries)",
+          "Secondary priority"
+        ]
+      },
+      "teams_webhook_url": ""
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+.cache/
+reports/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.env
+.DS_Store
+herald.config.json
+groups/*.json
+!groups/example.json

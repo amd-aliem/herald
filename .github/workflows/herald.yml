@@ -1,0 +1,68 @@
+name: Herald Digest
+
+on:
+  schedule:
+    # Weekly on Monday at 9:00 UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Number of days to look back'
+        required: false
+        default: '14'
+      group:
+        description: 'Group name to process (blank for all)'
+        required: false
+        default: ''
+      force:
+        description: 'Force regenerate (ignore cache)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  generate-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Generate digest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.days }}" ] && [ "${{ inputs.days }}" != "14" ]; then
+            ARGS="$ARGS --days ${{ inputs.days }}"
+          fi
+          if [ -n "${{ inputs.group }}" ]; then
+            ARGS="$ARGS --group ${{ inputs.group }}"
+          fi
+          if [ "${{ inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          python herald.py $ARGS --output digest-output.md
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: herald-digest-${{ github.run_number }}
+          path: |
+            digest-output.md
+            reports/
+          retention-days: 90
