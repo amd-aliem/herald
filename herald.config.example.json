@@ -21,7 +21,12 @@
           "repositories": [
             "owner/repo-1",
             "owner/repo-2"
-          ]
+          ],
+          "filters": {
+            "exclude_authors": ["dependabot[bot]"],
+            "exclude_titles": ["^chore:", "^docs:"],
+            "exclude_labels": ["wontfix"]
+          }
         }
       ],
       "team_context": {

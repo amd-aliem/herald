@@ -131,6 +131,22 @@ class GitHubSource(ActivitySource):
         self.max_commits: int = config.get("max_commits", 20)
         self.activity_types: List[str] = config.get("activity_types",
                                                      ["commits", "pulls", "issues", "releases"])
+        # Exclude filters — applied after fetching to remove noise
+        filters = config.get("filters", {})
+        self.exclude_authors: List[str] = filters.get("exclude_authors", [])
+        self.exclude_titles: List[str] = filters.get("exclude_titles", [])
+        self.exclude_labels: List[str] = filters.get("exclude_labels", [])
+
+        # Pre-compile regex patterns and convert labels to set for performance
+        self._compiled_title_patterns = []
+        for pattern in self.exclude_titles:
+            try:
+                self._compiled_title_patterns.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as e:
+                logger.warning("Invalid regex pattern '%s' in exclude_titles: %s (skipping)",
+                               pattern, e)
+        self._exclude_authors_set = set(self.exclude_authors)
+        self._exclude_labels_set = set(self.exclude_labels)
 
     def validate(self) -> bool:
         valid = True
@@ -309,6 +325,85 @@ class GitHubSource(ActivitySource):
         self.save_cache(cache_path, filtered)
         return filtered
 
+    # -- filtering --
+
+    def _has_filters(self) -> bool:
+        return bool(self._exclude_authors_set or self._compiled_title_patterns
+                     or self._exclude_labels_set)
+
+    def apply_filters(self, activity: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply exclude filters to fetched activity data.
+
+        Filters operate on:
+        - exclude_authors: exact match on commit author name, PR/issue user login
+        - exclude_titles: regex match on commit message subject, PR/issue title
+        - exclude_labels: exact match on PR/issue label names
+
+        Note: Commit filtering uses commit.author.name while PR/issue filtering uses
+        user.login. These are different GitHub API fields by design.
+        """
+        if not self._has_filters():
+            return activity
+
+        removed = 0
+
+        def _match_title(text: str) -> bool:
+            return any(p.search(text) for p in self._compiled_title_patterns)
+
+        def _match_author(author: str) -> bool:
+            return author in self._exclude_authors_set
+
+        def _match_labels(item: Dict) -> bool:
+            if not self.exclude_labels:
+                return False
+            item_labels = {lbl.get("name", "") for lbl in item.get("labels", [])}
+            return bool(item_labels & self._exclude_labels_set)
+
+        # Filter commits
+        if "commits" in activity:
+            original = len(activity["commits"])
+            activity["commits"] = [
+                c for c in activity["commits"]
+                if not (
+                    _match_author(c.get("commit", {}).get("author", {}).get("name", ""))
+                    or _match_title(c.get("commit", {}).get("message", "").split("\n")[0])
+                )
+            ]
+            removed += original - len(activity["commits"])
+
+        # Filter PRs
+        if "pulls" in activity:
+            original = len(activity["pulls"])
+            activity["pulls"] = [
+                p for p in activity["pulls"]
+                if not (
+                    _match_author(p.get("user", {}).get("login", ""))
+                    or _match_title(p.get("title", ""))
+                    or _match_labels(p)
+                )
+            ]
+            removed += original - len(activity["pulls"])
+
+        # Filter issues
+        if "issues" in activity:
+            original = len(activity["issues"])
+            activity["issues"] = [
+                i for i in activity["issues"]
+                if not (
+                    _match_author(i.get("user", {}).get("login", ""))
+                    or _match_title(i.get("title", ""))
+                    or _match_labels(i)
+                )
+            ]
+            removed += original - len(activity["issues"])
+
+        # Releases are not filtered (they are rarely noise)
+
+        if removed:
+            logger.info("  Filtered out %d items via exclude patterns", removed)
+
+        return activity
+
     # -- main fetch_activity implementation --
 
     def fetch_activity(self, since: datetime) -> List[Dict[str, Any]]:
@@ -339,6 +434,7 @@ class GitHubSource(ActivitySource):
                 activity["releases"] = self.fetch_releases(repo, since)
                 logger.info("  Found %d releases", len(activity['releases']))
 
+            activity = self.apply_filters(activity)
             results.append(activity)
 
         return results
