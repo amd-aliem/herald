@@ -4,7 +4,12 @@
       "type": "github",
       "repositories": [
         "owner/repo"
-      ]
+      ],
+      "filters": {
+        "exclude_authors": ["dependabot[bot]"],
+        "exclude_titles": ["^build\\(deps\\):"],
+        "exclude_labels": ["wontfix"]
+      }
     }
   ],
   "team_context": {

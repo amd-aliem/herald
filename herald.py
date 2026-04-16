@@ -755,6 +755,11 @@ class Herald:
                         except Exception as e:
                             logger.warning("Failed to load external config %s: %s",
                                            ext_path, e)
+                    else:
+                        group_name = group.get("name", group["config_file"])
+                        logger.warning("External config file not found: %s "
+                                       "(group '%s' will have no sources)",
+                                       ext_path, group_name)
                 resolved.append(group)
             self._apply_env_webhook(resolved)
             return resolved
@@ -794,6 +799,72 @@ class Herald:
             "max_commits": 20,
             "activity_types": ["commits", "pulls", "issues", "releases"]
         })
+
+    def validate(self) -> bool:
+        """Validate configuration without making API calls.
+
+        Checks: groups exist, sources have repos, repo format is valid,
+        AI backend is available, GITHUB_TOKEN is set.
+        Returns True if all checks pass.
+        """
+        valid = True
+        issues = 0
+
+        # Check groups
+        if not self.groups:
+            print("FAIL: No groups configured.")
+            valid = False
+        else:
+            print(f"OK: {len(self.groups)} group(s) configured")
+
+        for group in self.groups:
+            name = group.get("name", "unnamed")
+            sources = group.get("sources", [])
+            if not sources:
+                print(f"WARN: Group '{name}' has no sources")
+                issues += 1
+
+            for src in sources:
+                repos = src.get("repositories", [])
+                if not repos:
+                    print(f"WARN: Source in group '{name}' has no repositories")
+                    issues += 1
+                for repo in repos:
+                    parts = repo.split('/')
+                    if len(parts) != 2 or not all(parts):
+                        print(f"FAIL: Invalid repository format: {repo} "
+                              f"(expected owner/repo)")
+                        valid = False
+
+            team = group.get("team_context", {})
+            if not team.get("name"):
+                print(f"WARN: Group '{name}' has no team_context.name "
+                      f"(AI summaries will be generic)")
+                issues += 1
+
+        # Check AI backend
+        if self.ai_backend.validate():
+            print(f"OK: AI backend ({self.ai_backend.backend_type}) is available")
+        else:
+            print(f"WARN: AI backend ({self.ai_backend.backend_type}) not found. "
+                  f"Summaries will fall back to raw data.")
+            issues += 1
+
+        # Check GITHUB_TOKEN
+        if os.environ.get('GITHUB_TOKEN'):
+            print("OK: GITHUB_TOKEN is set (5000 requests/hour)")
+        else:
+            print("WARN: GITHUB_TOKEN not set (limited to 60 requests/hour)")
+            issues += 1
+
+        if valid and issues == 0:
+            print("\nAll checks passed.")
+        elif valid:
+            print(f"\nPassed with {issues} warning(s).")
+        else:
+            print(f"\nValidation failed.")
+
+        return valid
 
     def list_groups(self):
         """Print configured groups and exit."""
@@ -1496,6 +1567,11 @@ def main():
         help='Output the assembled AI prompt to stdout instead of calling the AI backend'
     )
     parser.add_argument(
+        '--validate',
+        action='store_true',
+        help='Validate configuration and check prerequisites without making API calls'
+    )
+    parser.add_argument(
         '--teams',
         action='store_true',
         help='Post digest to Microsoft Teams via Power Automate webhook'
@@ -1539,6 +1615,11 @@ def main():
     if args.list_groups:
         herald.list_groups()
         return
+
+    # Validate config and exit
+    if args.validate:
+        valid = herald.validate()
+        sys.exit(0 if valid else 1)
 
     # Parse repositories
     repositories = None
