@@ -62,6 +62,22 @@ python herald.py --list-groups
 
 # Use a custom config file
 python herald.py --config /path/to/config.json
+
+# Override team name in AI output
+python herald.py --team-name "Platform Team"
+
+# Validate config without running
+python herald.py --validate
+
+# Preview what would run without calling AI or posting
+python herald.py --dry-run
+
+# Output the assembled AI prompt only (no AI call)
+python herald.py --prompt-only
+
+# Verbose or quiet logging
+python herald.py -v          # DEBUG level
+python herald.py -q          # WARNING level only
 ```
 
 ## Configuration
@@ -109,7 +125,12 @@ Each group file contains sources, team context, and optional webhook URL:
   "sources": [
     {
       "type": "github",
-      "repositories": ["owner/repo-1", "owner/repo-2"]
+      "repositories": ["owner/repo-1", "owner/repo-2"],
+      "filters": {
+        "exclude_authors": ["dependabot[bot]"],
+        "exclude_titles": ["^build\\(deps\\):"],
+        "exclude_labels": ["wontfix"]
+      }
     }
   ],
   "team_context": {
@@ -147,6 +168,9 @@ Then add a stub to `herald.config.json`:
 | `groups[].config_file` | Path to external group config (relative to config file) |
 | `groups[].sources[].type` | Source type (`"github"`) |
 | `groups[].sources[].repositories` | List of `owner/repo` strings |
+| `groups[].sources[].filters.exclude_authors` | Author usernames to exclude (exact match) |
+| `groups[].sources[].filters.exclude_titles` | Regex patterns to exclude by title (case-insensitive) |
+| `groups[].sources[].filters.exclude_labels` | Labels to exclude (exact match, PRs/issues only) |
 | `groups[].team_context.name` | Team display name used in prompts |
 | `groups[].team_context.focus_areas` | List of focus areas injected into the AI prompt |
 | `groups[].team_context.priorities` | Ordered list; first entry is flagged as critical priority |
@@ -168,6 +192,39 @@ Herald also accepts the legacy flat format with `repositories` at the top level.
   "activity_types": ["commits", "pulls", "issues", "releases"],
   "team_context": { "name": "My Team", "priorities": ["..."] }
 }
+```
+
+### Environment Variables
+
+Herald settings can be overridden via environment variables, useful for CI/cron deployments:
+
+| Variable | Overrides | Example |
+|---|---|---|
+| `HERALD_CONFIG` | Config file path | `HERALD_CONFIG=/etc/herald/config.json` |
+| `HERALD_DAYS` | `defaults.time_window_days` | `HERALD_DAYS=30` |
+| `HERALD_MAX_COMMITS` | `defaults.max_commits` | `HERALD_MAX_COMMITS=50` |
+| `HERALD_TEAMS_WEBHOOK` | `teams_webhook_url` (all groups) | `HERALD_TEAMS_WEBHOOK=https://...` |
+| `GITHUB_TOKEN` | GitHub API authentication | `GITHUB_TOKEN=ghp_...` |
+
+## Sample Output
+
+Herald generates a digest with a TL;DR, categorized summary, and recommended actions:
+
+```
+**TL;DR:** Three attestation-related PRs merged improving SEV-SNP quote parsing and VCEK caching.
+
+### Summary
+
+#### High Priority — AMD SEV-SNP
+- **PR #412** (merged): Refactored SNP quote parser to handle v3 report format...
+- **PR #408** (merged): Added VCEK certificate caching to reduce KDS lookups...
+
+#### Other Notable Activity
+- **Issue #415** (opened): Request for TDX attestation parity with SNP flow...
+
+### Recommended Actions
+1. Review PR #412 for compatibility with existing attestation verification tests
+2. Track Issue #415 — may require AMD-side changes to keep feature parity
 ```
 
 ## Reports
@@ -316,6 +373,8 @@ export GITHUB_TOKEN=your_token
 python herald.py
 ```
 
+Each repository consumes 4-8 API calls (one per activity type, plus pagination). With 10 repos, unauthenticated usage (~60 req/hour) exhausts the quota rapidly. Use a token for any non-trivial setup.
+
 ### No activity found
 
 - Verify repository names are in `owner/repo` format
@@ -324,7 +383,7 @@ python herald.py
 
 ### Cache
 
-Cache is stored in `.cache/` with a 1-hour TTL. To clear:
+Cache is stored in `.cache/` with a 1-hour TTL. Files older than 7 days are pruned automatically on each run. To clear manually:
 
 ```bash
 rm -rf .cache/
