@@ -641,19 +641,21 @@ class Herald:
     def strip_conversational_output(self, text: str) -> str:
         """Strip conversational preamble and postamble from AI output.
 
-        Removes text before the first ### heading and trailing conversational
-        lines after the last substantive content (bullets, headings, numbered lists).
-        Falls back to original text if stripping would result in empty output.
+        Removes text before the first **TL;DR:** line or ### heading and trailing
+        conversational lines after the last substantive content (bullets, headings,
+        numbered lists). Falls back to original text if stripping would result in
+        empty output.
         """
         if not text:
             return text
 
         lines = text.split('\n')
 
-        # Strip preamble: find first ### heading
+        # Strip preamble: find first ### heading or **TL;DR:** line
         start_idx = 0
         for i, line in enumerate(lines):
-            if line.strip().startswith('###'):
+            stripped = line.strip()
+            if stripped.startswith('###') or stripped.startswith('**TL;DR:**'):
                 start_idx = i
                 break
 
@@ -747,6 +749,8 @@ class Herald:
         # Analysis instructions
         prompt += """Please analyze this activity and provide a structured response with the following format:
 
+**TL;DR:** <One sentence (max 25 words) capturing the single most important development or theme across all repositories in this digest.>
+
 ### Summary
 
 Create 3-7 concise bullet points highlighting:
@@ -796,11 +800,11 @@ These recommendations should be tailored to the team's focus areas and prioritie
 
 Each recommendation should be concrete, directly related to the activity above, and clearly explain WHY it matters to the team.
 
-IMPORTANT: Use exactly the header levels shown above (### for both sections). Do not include any other top-level headers.
+IMPORTANT: Use exactly the header levels shown above (### for the two section headers). Do not include any other top-level headers.
 
-OUTPUT FORMAT: Output ONLY the two markdown sections (### Summary and ### Recommended Actions).
+OUTPUT FORMAT: Output the TL;DR line followed by the two markdown sections (### Summary and ### Recommended Actions).
 Do not include any introduction, preamble, conclusion, sign-off, or conversational text.
-Start directly with "### Summary"."""
+Start directly with "**TL;DR:**"."""
 
         return prompt
 

@@ -61,7 +61,7 @@ The entire application is `herald.py`, structured into three classes plus a CLI 
 - `generate_group_digest(group)` — processes one group end-to-end
 - `generate_digest(group_names, repositories)` — iterates groups
 - `format_prompt(activity_list, team_context)` — dynamic priority injection from `team_context["priorities"][0]`; includes output format constraint
-- `strip_conversational_output(text)` — strips preamble before first `###` heading and trailing conversational lines
+- `strip_conversational_output(text)` — strips preamble before first `**TL;DR:**` line or `###` heading and trailing conversational lines
 - `generate_summary()` — orchestrates prompt + AI backend call with caching and output stripping
 - `save_detailed_report(group_name, activity_list)` — writes to `reports/<group>/`
 - `post_to_teams(digest, webhook_url)` / `markdown_to_adaptive_card_blocks()` — Teams Adaptive Card integration
