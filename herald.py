@@ -5,6 +5,7 @@ Fetches recent activity from configured sources and generates AI-powered summari
 """
 
 import json
+import logging
 import sys
 import os
 import argparse
@@ -16,6 +17,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
+
+logger = logging.getLogger("herald")
 
 try:
     import requests
@@ -35,6 +38,27 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 RAW_ACTIVITY_HEADER = "**Raw Activity Data:**"
+
+
+def setup_logging(verbose: bool = False, quiet: bool = False):
+    """Configure logging for Herald.
+
+    Logs go to stderr so stdout remains clean for digest output.
+    A file handler is added later by Herald.__init__() once cache_dir is known.
+    """
+    herald_logger = logging.getLogger("herald")
+
+    if verbose:
+        herald_logger.setLevel(logging.DEBUG)
+    elif quiet:
+        herald_logger.setLevel(logging.WARNING)
+    else:
+        herald_logger.setLevel(logging.INFO)
+
+    # stderr handler — concise format for interactive use
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    herald_logger.addHandler(stderr_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +105,7 @@ class ActivitySource(ABC):
             with open(cache_path, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Warning: Failed to load cache from {cache_path}: {e}")
+            logger.warning("Failed to load cache from %s: %s", cache_path, e)
             return None
 
     def save_cache(self, cache_path: Path, data: Any):
@@ -89,7 +113,7 @@ class ActivitySource(ABC):
             with open(cache_path, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            print(f"Warning: Failed to save cache to {cache_path}: {e}")
+            logger.warning("Failed to save cache to %s: %s", cache_path, e)
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +137,7 @@ class GitHubSource(ActivitySource):
         for repo in self.repositories:
             parts = repo.split('/')
             if len(parts) != 2 or not all(parts):
-                print(f"Error: Invalid repository format: {repo} (expected owner/repo)")
+                logger.error("Invalid repository format: %s (expected owner/repo)", repo)
                 valid = False
         return valid
 
@@ -138,23 +162,23 @@ class GitHubSource(ActivitySource):
                     reset_time = response.headers.get('X-RateLimit-Reset', 'unknown')
                     if reset_time != 'unknown':
                         reset_dt = datetime.fromtimestamp(int(reset_time))
-                        print(f"Error: GitHub API rate limit exceeded. Resets at {reset_dt}")
+                        logger.error("GitHub API rate limit exceeded. Resets at %s", reset_dt)
                     else:
-                        print("Error: GitHub API rate limit exceeded.")
+                        logger.error("GitHub API rate limit exceeded.")
                     return None
 
             if response.status_code == 404:
-                print(f"Error: Resource not found (404): {url}")
+                logger.error("Resource not found (404): %s", url)
                 return None
 
             response.raise_for_status()
             return response.json()
 
         except requests.exceptions.Timeout:
-            print(f"Error: Request timeout for {url}")
+            logger.error("Request timeout for %s", url)
             return None
         except requests.exceptions.RequestException as e:
-            print(f"Error: Request failed for {url}: {e}")
+            logger.error("Request failed for %s: %s", url, e)
             return None
 
     # -- per-activity-type fetchers --
@@ -165,7 +189,7 @@ class GitHubSource(ActivitySource):
         if self.is_cache_valid(cache_path):
             cached_data = self.load_cache(cache_path)
             if cached_data:
-                print(f"  Using cached commits data")
+                logger.debug("Using cached commits data")
                 return cached_data
 
         url = f"https://api.github.com/repos/{repo}/commits"
@@ -178,7 +202,7 @@ class GitHubSource(ActivitySource):
         if data is None:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
-                print(f"  Using stale cache for commits")
+                logger.debug("Using stale cache for commits")
                 return stale_cache
             return []
 
@@ -191,7 +215,7 @@ class GitHubSource(ActivitySource):
         if self.is_cache_valid(cache_path):
             cached_data = self.load_cache(cache_path)
             if cached_data:
-                print(f"  Using cached pull requests data")
+                logger.debug("Using cached pull requests data")
                 return cached_data
 
         url = f"https://api.github.com/repos/{repo}/pulls"
@@ -206,7 +230,7 @@ class GitHubSource(ActivitySource):
         if data is None:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
-                print(f"  Using stale cache for pull requests")
+                logger.debug("Using stale cache for pull requests")
                 return stale_cache
             return []
 
@@ -225,7 +249,7 @@ class GitHubSource(ActivitySource):
         if self.is_cache_valid(cache_path):
             cached_data = self.load_cache(cache_path)
             if cached_data:
-                print(f"  Using cached issues data")
+                logger.debug("Using cached issues data")
                 return cached_data
 
         url = f"https://api.github.com/repos/{repo}/issues"
@@ -240,7 +264,7 @@ class GitHubSource(ActivitySource):
         if data is None:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
-                print(f"  Using stale cache for issues")
+                logger.debug("Using stale cache for issues")
                 return stale_cache
             return []
 
@@ -261,7 +285,7 @@ class GitHubSource(ActivitySource):
         if self.is_cache_valid(cache_path):
             cached_data = self.load_cache(cache_path)
             if cached_data:
-                print(f"  Using cached releases data")
+                logger.debug("Using cached releases data")
                 return cached_data
 
         url = f"https://api.github.com/repos/{repo}/releases"
@@ -271,7 +295,7 @@ class GitHubSource(ActivitySource):
         if data is None:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
-                print(f"  Using stale cache for releases")
+                logger.debug("Using stale cache for releases")
                 return stale_cache
             return []
 
@@ -291,7 +315,7 @@ class GitHubSource(ActivitySource):
         """Fetch activity for all configured repositories."""
         results = []
         for repo in self.repositories:
-            print(f"\nFetching activity for {repo}...")
+            logger.info("Fetching activity for %s...", repo)
 
             activity: Dict[str, Any] = {
                 "repository": repo,
@@ -301,19 +325,19 @@ class GitHubSource(ActivitySource):
 
             if "commits" in self.activity_types:
                 activity["commits"] = self.fetch_commits(repo, since)
-                print(f"  Found {len(activity['commits'])} commits")
+                logger.info("  Found %d commits", len(activity['commits']))
 
             if "pulls" in self.activity_types:
                 activity["pulls"] = self.fetch_pulls(repo, since)
-                print(f"  Found {len(activity['pulls'])} pull requests")
+                logger.info("  Found %d pull requests", len(activity['pulls']))
 
             if "issues" in self.activity_types:
                 activity["issues"] = self.fetch_issues(repo, since)
-                print(f"  Found {len(activity['issues'])} issues")
+                logger.info("  Found %d issues", len(activity['issues']))
 
             if "releases" in self.activity_types:
                 activity["releases"] = self.fetch_releases(repo, since)
-                print(f"  Found {len(activity['releases'])} releases")
+                logger.info("  Found %d releases", len(activity['releases']))
 
             results.append(activity)
 
@@ -371,15 +395,14 @@ class ClaudeCLIBackend(AIBackend):
     def summarize(self, prompt: str, label: str = "") -> Optional[str]:
         """Call Claude CLI with the prompt and return the summary."""
         if not shutil.which('claude'):
-            print("\nError: Claude CLI not found.")
-            print("Please install and authenticate:")
-            print("  brew install claude  # or follow https://github.com/anthropics/claude-code")
-            print("  claude auth login")
+            logger.error("Claude CLI not found. Install and authenticate:")
+            logger.error("  brew install claude  # or follow https://github.com/anthropics/claude-code")
+            logger.error("  claude auth login")
             return None
 
         try:
-            print(f"  Calling Claude CLI...")
-            print(f"  Prompt length: {len(prompt)} characters")
+            logger.info("Calling Claude CLI...")
+            logger.info("Prompt length: %d characters", len(prompt))
 
             result = subprocess.run(
                 ['claude', '-'],
@@ -389,58 +412,42 @@ class ClaudeCLIBackend(AIBackend):
             )
 
             if result.returncode != 0:
-                print(f"\n{'='*80}")
-                print(f"ERROR: Claude CLI failed with exit code {result.returncode}")
-                print(f"{'='*80}")
+                logger.error("Claude CLI failed with exit code %d", result.returncode)
 
                 stderr_output = result.stderr.decode('utf-8', errors='replace')
                 stdout_output = result.stdout.decode('utf-8', errors='replace')
 
                 if stderr_output:
-                    print(f"\nStderr output:")
-                    print(f"{'-'*80}")
-                    print(stderr_output)
-                    print(f"{'-'*80}")
-
+                    logger.error("Stderr: %s", stderr_output)
                 if stdout_output:
-                    print(f"\nStdout output:")
-                    print(f"{'-'*80}")
-                    print(stdout_output)
-                    print(f"{'-'*80}")
+                    logger.debug("Stdout: %s", stdout_output)
 
                 self._save_debug_prompt(prompt, label, "failed")
                 return None
 
             output = result.stdout.decode('utf-8', errors='replace').strip()
             if not output:
-                print("\nWarning: Claude CLI returned empty output")
-                print(f"  Exit code: {result.returncode}")
-                print(f"  Stderr: {result.stderr.decode('utf-8', errors='replace')}")
+                logger.warning("Claude CLI returned empty output (exit code: %d)",
+                               result.returncode)
+                logger.debug("Stderr: %s",
+                             result.stderr.decode('utf-8', errors='replace'))
                 self._save_debug_prompt(prompt, label, "empty")
                 return None
 
-            print("  Claude summary generated successfully")
-            print(f"  Summary length: {len(output)} characters")
+            logger.info("Claude summary generated successfully (%d characters)",
+                        len(output))
             return output
 
         except subprocess.TimeoutExpired:
-            print(f"\n{'='*80}")
-            print(f"ERROR: Claude CLI timeout after {self.timeout} seconds")
-            print(f"{'='*80}")
-            print("This might indicate:")
-            print("  - The prompt is too large")
-            print("  - Network connectivity issues")
-            print("  - Claude API issues")
+            logger.error("Claude CLI timeout after %d seconds", self.timeout)
+            logger.error("This might indicate: large prompt, network issues, "
+                         "or Claude API issues")
             self._save_debug_prompt(prompt, label, "timeout")
-            print(f"{'='*80}\n")
             return None
         except Exception as e:
-            print(f"\n{'='*80}")
-            print(f"ERROR: Exception calling Claude CLI: {e}")
-            print(f"{'='*80}")
-            print(f"Exception type: {type(e).__name__}")
+            logger.error("Exception calling Claude CLI: %s (%s)",
+                         e, type(e).__name__)
             self._save_debug_prompt(prompt, label, "exception")
-            print(f"{'='*80}\n")
             return None
 
     def _save_debug_prompt(self, prompt: str, label: str, reason: str):
@@ -453,9 +460,9 @@ class ClaudeCLIBackend(AIBackend):
         try:
             with open(debug_file, 'w') as f:
                 f.write(prompt)
-            print(f"\nDebug: Prompt saved to {debug_file}")
+            logger.debug("Prompt saved to %s", debug_file)
         except Exception as e:
-            print(f"\nWarning: Could not save debug prompt: {e}")
+            logger.warning("Could not save debug prompt: %s", e)
 
 
 # AI backend registry — add new backends here
@@ -477,6 +484,19 @@ class Herald:
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_ttl = 3600
         self.config_dir = Path(__file__).parent  # default, overridden by load_config
+
+        # Add file-based log handler now that cache_dir is known
+        herald_logger = logging.getLogger("herald")
+        if not any(isinstance(h, logging.FileHandler) for h in herald_logger.handlers):
+            try:
+                file_handler = logging.FileHandler(self.cache_dir / "herald.log")
+                file_handler.setFormatter(
+                    logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+                )
+                herald_logger.addHandler(file_handler)
+            except Exception as e:
+                logger.warning("Could not create log file handler: %s", e)
+
         self.config = self.load_config(config_path)
         self.groups = self.resolve_groups()
         self.all_summaries_failed = False
@@ -487,7 +507,8 @@ class Herald:
         backend_type = ai_config.get("type", "claude-cli")
         backend_cls = AI_BACKEND_REGISTRY.get(backend_type)
         if not backend_cls:
-            print(f"Warning: Unknown AI backend '{backend_type}', falling back to claude-cli")
+            logger.warning("Unknown AI backend '%s', falling back to claude-cli",
+                           backend_type)
             backend_cls = ClaudeCLIBackend
         self.ai_backend = backend_cls(ai_config, self.cache_dir, force_refresh)
 
@@ -515,8 +536,9 @@ class Herald:
                              Path.home() / ".occ-digest.config.json"]:
                     if Path(path).exists():
                         config_path = str(path)
-                        print(f"Warning: Using legacy config {path}. "
-                              f"Consider renaming to herald.config.json")
+                        logger.warning("Using legacy config %s. "
+                                       "Consider renaming to herald.config.json",
+                                       path)
                         break
 
         if config_path and Path(config_path).exists():
@@ -525,9 +547,10 @@ class Herald:
                 with open(config_path, 'r') as f:
                     user_config = json.load(f)
                     default_config.update(user_config)
-                    print(f"Loaded config from: {config_path}")
+                    logger.info("Loaded config from: %s", config_path)
             except Exception as e:
-                print(f"Warning: Failed to load config from {config_path}: {e}")
+                logger.warning("Failed to load config from %s: %s",
+                               config_path, e)
 
         return default_config
 
@@ -552,7 +575,8 @@ class Herald:
                             resolved.append(ext_config)
                             continue
                         except Exception as e:
-                            print(f"Warning: Failed to load external config {ext_path}: {e}")
+                            logger.warning("Failed to load external config %s: %s",
+                                           ext_path, e)
                 resolved.append(group)
             return resolved
 
@@ -791,10 +815,10 @@ Start directly with "### Summary"."""
         if not self.force_refresh and self.is_cache_valid(summary_cache):
             cached = self.load_cache_text(summary_cache)
             if cached:
-                print(f"\n  Using cached summary for {group_name}")
+                logger.info("Using cached summary for %s", group_name)
                 return cached
 
-        print(f"\n  Generating AI summary for {group_name}...")
+        logger.info("Generating AI summary for %s...", group_name)
 
         prompt = self.format_prompt(activity_list, team_context)
         summary = self.ai_backend.summarize(prompt, group_name)
@@ -826,7 +850,7 @@ Start directly with "### Summary"."""
             with open(cache_path, 'w') as f:
                 f.write(text)
         except Exception as e:
-            print(f"Warning: Failed to save cache to {cache_path}: {e}")
+            logger.warning("Failed to save cache to %s: %s", cache_path, e)
 
     # -- report generation --
 
@@ -897,7 +921,7 @@ Start directly with "### Summary"."""
         with open(output_file, 'w') as f:
             f.write(output)
 
-        print(f"\nDetailed report saved to: {output_file}")
+        logger.info("Detailed report saved to: %s", output_file)
 
     def format_raw_data(self, activity_list: List[Dict[str, Any]]) -> str:
         """Format raw activity data as markdown (fallback when Claude CLI is unavailable)."""
@@ -998,10 +1022,10 @@ Start directly with "### Summary"."""
     def post_to_teams(self, digest_output: str, webhook_url: str) -> bool:
         """Post digest to Microsoft Teams via Power Automate webhook."""
         if not webhook_url:
-            print("Error: No webhook URL provided.")
+            logger.error("No webhook URL provided.")
             return False
 
-        print("\nPosting digest to Microsoft Teams...")
+        logger.info("Posting digest to Microsoft Teams...")
 
         card_body = self.markdown_to_adaptive_card_blocks(digest_output)
 
@@ -1030,15 +1054,15 @@ Start directly with "### Summary"."""
             )
 
             if response.status_code in (200, 202):
-                print("Successfully posted digest to Teams channel.")
+                logger.info("Successfully posted digest to Teams channel.")
                 return True
             else:
-                print(f"Error posting to Teams: HTTP {response.status_code}")
-                print(f"Response: {response.text[:500]}")
+                logger.error("Error posting to Teams: HTTP %d", response.status_code)
+                logger.error("Response: %s", response.text[:500])
                 return False
 
         except requests.exceptions.RequestException as e:
-            print(f"Error posting to Teams: {e}")
+            logger.error("Error posting to Teams: %s", e)
             return False
 
     # -- group digest generation --
@@ -1064,7 +1088,7 @@ Start directly with "### Summary"."""
             src_type = src_config.get("type", "github")
             source_cls = SOURCE_REGISTRY.get(src_type)
             if not source_cls:
-                print(f"Warning: Unknown source type '{src_type}', skipping")
+                logger.warning("Unknown source type '%s', skipping", src_type)
                 continue
 
             # Merge defaults into source config
@@ -1072,7 +1096,8 @@ Start directly with "### Summary"."""
             source = source_cls(merged_config, self.cache_dir, self.force_refresh)
 
             if not source.validate():
-                print(f"Error: Source validation failed for {src_type} in group {group_name}")
+                logger.error("Source validation failed for %s in group %s",
+                             src_type, group_name)
                 continue
 
             activity = source.fetch_activity(since)
@@ -1149,12 +1174,12 @@ Start directly with "### Summary"."""
             groups_to_process = [g for g in self.groups if g.get("name") in group_names]
             missing = set(group_names) - {g.get("name") for g in groups_to_process}
             if missing:
-                print(f"Warning: Groups not found: {', '.join(missing)}")
+                logger.warning("Groups not found: %s", ', '.join(missing))
         else:
             groups_to_process = self.groups
 
         if not groups_to_process:
-            print("Error: No groups to process.")
+            logger.error("No groups to process.")
             sys.exit(1)
 
         combined_output = ""
@@ -1170,7 +1195,7 @@ Start directly with "### Summary"."""
 
         self.all_summaries_failed = all_summaries_failed
         if all_summaries_failed:
-            print("\nWarning: All Claude summaries failed. Check Claude CLI setup.")
+            logger.warning("All AI summaries failed. Check AI backend setup.")
 
         return combined_output
 
@@ -1222,7 +1247,22 @@ def main():
         help='Print configured groups and exit'
     )
 
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable debug-level logging'
+    )
+    verbosity.add_argument(
+        '--quiet', '-q',
+        action='store_true',
+        help='Suppress info messages; show only warnings and errors'
+    )
+
     args = parser.parse_args()
+
+    # Configure logging before anything else
+    setup_logging(verbose=args.verbose, quiet=args.quiet)
 
     # Initialize
     herald = Herald(config_path=args.config, force_refresh=args.force)
@@ -1248,16 +1288,15 @@ def main():
     if args.output:
         with open(args.output, 'w') as f:
             f.write(output)
-        print(f"\nSummary written to: {args.output}")
+        logger.info("Summary written to: %s", args.output)
     else:
-        print("\n" + "=" * 80)
+        # Digest output goes to stdout (not logging) so it can be piped/redirected
         print(output)
-        print("=" * 80)
 
     # Post to Teams if requested
     if args.teams:
         if herald.all_summaries_failed:
-            print("\nSkipping Teams post: AI summary generation failed.")
+            logger.warning("Skipping Teams post: AI summary generation failed.")
         else:
             # Post to each group's webhook
             for group in herald.groups:
