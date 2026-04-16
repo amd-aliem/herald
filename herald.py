@@ -603,9 +603,10 @@ class Herald:
     """Main orchestrator for fetching activity and generating digests."""
 
     def __init__(self, config_path: Optional[str] = None, force_refresh: bool = False,
-                 dry_run: bool = False):
+                 dry_run: bool = False, prompt_only: bool = False):
         self.force_refresh = force_refresh
         self.dry_run = dry_run
+        self.prompt_only = prompt_only
         self.cache_dir = Path(__file__).parent / ".cache"
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_ttl = 3600
@@ -828,11 +829,14 @@ class Herald:
 
         lines = text.split('\n')
 
-        # Strip preamble: find first ### heading or **TL;DR:** line
+        # Strip preamble: find first ### heading or TL;DR line
+        # Handle TL;DR variants: **TL;DR:**, **TL;DR**, TL;DR:
         start_idx = 0
         for i, line in enumerate(lines):
             stripped = line.strip()
-            if stripped.startswith('###') or stripped.startswith('**TL;DR:**'):
+            if (stripped.startswith('###')
+                    or stripped.startswith('**TL;DR')
+                    or stripped.startswith('TL;DR')):
                 start_idx = i
                 break
 
@@ -1305,6 +1309,11 @@ Start directly with "**TL;DR:**"."""
         if not all_activity:
             return f"No activity found for group {group_name}.\n", True
 
+        # --prompt-only: output the assembled prompt and skip everything else
+        if self.prompt_only:
+            prompt = self.format_prompt(all_activity, team_context)
+            return prompt, True
+
         # Save detailed report (skip in dry-run mode)
         if self.dry_run:
             logger.info("[dry-run] Would save detailed report for group '%s'",
@@ -1463,6 +1472,11 @@ def main():
         help='Fetch activity but skip AI summarization, report saving, and Teams posting'
     )
     parser.add_argument(
+        '--prompt-only',
+        action='store_true',
+        help='Output the assembled AI prompt to stdout instead of calling the AI backend'
+    )
+    parser.add_argument(
         '--teams',
         action='store_true',
         help='Post digest to Microsoft Teams via Power Automate webhook'
@@ -1500,7 +1514,7 @@ def main():
 
     # Initialize
     herald = Herald(config_path=config_path, force_refresh=args.force,
-                    dry_run=args.dry_run)
+                    dry_run=args.dry_run, prompt_only=args.prompt_only)
 
     # List groups and exit
     if args.list_groups:
