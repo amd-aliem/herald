@@ -155,6 +155,9 @@ class GitHubSource(ActivitySource):
             if len(parts) != 2 or not all(parts):
                 logger.error("Invalid repository format: %s (expected owner/repo)", repo)
                 valid = False
+        if valid and not os.environ.get('GITHUB_TOKEN'):
+            logger.info("Tip: set GITHUB_TOKEN for higher API rate limits "
+                        "(5000 vs 60 requests/hour)")
         return valid
 
     # -- GitHub API helpers --
@@ -650,6 +653,13 @@ class Herald:
             except Exception as e:
                 logger.warning("Failed to load config from %s: %s",
                                config_path, e)
+        elif config_path:
+            logger.error("Config file not found: %s", config_path)
+            sys.exit(1)
+        else:
+            logger.warning("No config file found. Using defaults. "
+                           "Create herald.config.json or use --repos to get started. "
+                           "See herald.config.example.json for reference.")
 
         return default_config
 
@@ -1339,8 +1349,15 @@ Start directly with "**TL;DR:**"."""
             groups_to_process = self.groups
 
         if not groups_to_process:
-            logger.error("No groups to process.")
+            logger.error("No groups to process. Use --repos owner/repo or configure groups "
+                         "in herald.config.json")
             sys.exit(1)
+
+        # Pre-flight: warn if AI backend is unavailable (before expensive fetches)
+        if not self.dry_run and not self.ai_backend.validate():
+            logger.warning("AI backend (%s) is not available. "
+                           "Summaries will fall back to raw data.",
+                           self.ai_backend.backend_type)
 
         combined_output = ""
         for group in groups_to_process:
