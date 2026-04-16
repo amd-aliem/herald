@@ -628,6 +628,7 @@ class Herald:
         self._apply_env_overrides()
         self.groups = self.resolve_groups()
         self.all_summaries_failed = False
+        self._prune_cache()
 
         # Initialize AI backend
         defaults = self.config.get("defaults", {})
@@ -889,8 +890,8 @@ class Herald:
             commits = activity.get("commits", [])
             pulls = activity.get("pulls", [])
 
-            # Deduplicate: collect SHAs covered by merged PRs so they are not
-            # repeated in both the COMMITS and PULL REQUESTS sections
+            # Deduplicate: collect SHAs associated with PRs (merge commits
+            # and head SHAs) so they are not repeated in both sections
             pr_shas = set()
             for pr in pulls:
                 if pr.get("merge_commit_sha"):
@@ -898,7 +899,8 @@ class Herald:
                 if pr.get("head", {}).get("sha"):
                     pr_shas.add(pr["head"]["sha"])
 
-            deduped_commits = [c for c in commits if c["sha"] not in pr_shas]
+            deduped_commits = [c for c in commits
+                               if c.get("sha") not in pr_shas]
             skipped = len(commits) - len(deduped_commits)
             if skipped:
                 logger.debug("Deduplicated %d commits already covered by PRs in %s",
@@ -1054,6 +1056,23 @@ Start directly with "**TL;DR:**"."""
                 f.write(text)
         except Exception as e:
             logger.warning("Failed to save cache to %s: %s", cache_path, e)
+
+    def _prune_cache(self, max_age_days: int = 7):
+        """Remove cache files older than max_age_days. Skips herald.log."""
+        cutoff = datetime.now().timestamp() - (max_age_days * 86400)
+        pruned = 0
+        try:
+            for f in self.cache_dir.iterdir():
+                if f.name == "herald.log" or f.is_dir():
+                    continue
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    pruned += 1
+            if pruned:
+                logger.debug("Pruned %d stale cache files (older than %d days)",
+                             pruned, max_age_days)
+        except Exception as e:
+            logger.debug("Cache pruning failed: %s", e)
 
     # -- report generation --
 
@@ -1408,7 +1427,7 @@ Start directly with "**TL;DR:**"."""
             sys.exit(1)
 
         # Pre-flight: warn if AI backend is unavailable (before expensive fetches)
-        if not self.dry_run and not self.ai_backend.validate():
+        if not self.dry_run and not self.prompt_only and not self.ai_backend.validate():
             logger.warning("AI backend (%s) is not available. "
                            "Summaries will fall back to raw data.",
                            self.ai_backend.backend_type)
