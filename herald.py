@@ -596,6 +596,7 @@ class Herald:
                 logger.warning("Could not create log file handler: %s", e)
 
         self.config = self.load_config(config_path)
+        self._apply_env_overrides()
         self.groups = self.resolve_groups()
         self.all_summaries_failed = False
 
@@ -652,6 +653,48 @@ class Herald:
 
         return default_config
 
+    def _apply_env_overrides(self):
+        """Apply HERALD_* environment variable overrides to config.
+
+        Supported variables:
+        - HERALD_DAYS: override defaults.time_window_days (integer)
+        - HERALD_MAX_COMMITS: override defaults.max_commits (integer)
+        - HERALD_TEAMS_WEBHOOK: set webhook URL for groups that lack one
+        """
+        defaults = self.config.setdefault("defaults", {})
+
+        days = os.environ.get("HERALD_DAYS")
+        if days:
+            try:
+                defaults["time_window_days"] = int(days)
+                logger.info("HERALD_DAYS=%s overrides time_window_days", days)
+            except ValueError:
+                logger.warning("HERALD_DAYS=%s is not a valid integer, ignoring", days)
+
+        max_commits = os.environ.get("HERALD_MAX_COMMITS")
+        if max_commits:
+            try:
+                defaults["max_commits"] = int(max_commits)
+                logger.info("HERALD_MAX_COMMITS=%s overrides max_commits", max_commits)
+            except ValueError:
+                logger.warning("HERALD_MAX_COMMITS=%s is not a valid integer, ignoring",
+                               max_commits)
+
+        webhook = os.environ.get("HERALD_TEAMS_WEBHOOK")
+        if webhook:
+            # Applied later during resolve_groups; store on config for now
+            self.config["_env_teams_webhook"] = webhook
+            logger.info("HERALD_TEAMS_WEBHOOK set via environment")
+
+    def _apply_env_webhook(self, groups: List[Dict[str, Any]]):
+        """Apply HERALD_TEAMS_WEBHOOK to groups that lack a webhook URL."""
+        webhook = self.config.get("_env_teams_webhook")
+        if not webhook:
+            return
+        for group in groups:
+            if not group.get("teams_webhook_url"):
+                group["teams_webhook_url"] = webhook
+
     def resolve_groups(self) -> List[Dict[str, Any]]:
         """Parse groups from config. Wraps flat config as single group for backward compat."""
         config = self.config
@@ -676,6 +719,7 @@ class Herald:
                             logger.warning("Failed to load external config %s: %s",
                                            ext_path, e)
                 resolved.append(group)
+            self._apply_env_webhook(resolved)
             return resolved
 
         # Legacy flat config: repositories at top level
@@ -700,7 +744,9 @@ class Herald:
             webhook = config.get("teams_webhook_url")
             if webhook:
                 group["teams_webhook_url"] = webhook
-            return [group]
+            groups = [group]
+            self._apply_env_webhook(groups)
+            return groups
 
         return []
 
@@ -1383,8 +1429,11 @@ def main():
     # Configure logging before anything else
     setup_logging(verbose=args.verbose, quiet=args.quiet)
 
+    # Resolve config path: CLI arg > HERALD_CONFIG env var > auto-discovery
+    config_path = args.config or os.environ.get("HERALD_CONFIG")
+
     # Initialize
-    herald = Herald(config_path=args.config, force_refresh=args.force,
+    herald = Herald(config_path=config_path, force_refresh=args.force,
                     dry_run=args.dry_run)
 
     # List groups and exit

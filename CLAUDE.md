@@ -92,13 +92,23 @@ Config is split into two layers to keep secrets and team-specific data out of ve
 
 - `sources[].type` — source type (`"github"`)
 - `sources[].repositories` — list of `owner/repo` strings
+- `sources[].filters.exclude_authors` — exact-match author/login names to exclude
+- `sources[].filters.exclude_titles` — regex patterns to exclude by title/subject
+- `sources[].filters.exclude_labels` — exact-match label names to exclude (PRs/issues)
 - `team_context.name`, `.focus_areas`, `.priorities` — injected into Claude prompts
 - `teams_webhook_url` — Power Automate webhook (optional)
 
 Groups can also be defined inline in `herald.config.json` (see `herald.config.example.json`). Flat legacy configs with top-level `repositories` are auto-wrapped as a single group.
 
+### Environment variables
+
+- `HERALD_CONFIG` — config file path (overridden by `--config` CLI arg)
+- `HERALD_DAYS` — override `defaults.time_window_days` (integer)
+- `HERALD_MAX_COMMITS` — override `defaults.max_commits` (integer)
+- `HERALD_TEAMS_WEBHOOK` — set webhook URL for groups that lack one
+- `GITHUB_TOKEN` — GitHub API token for higher rate limits (5000 vs 60 req/hour)
+
 ## Dependencies
 
 - **Python**: `requests`, `python-dateutil` (see `requirements.txt`)
 - **System**: Claude CLI (default AI backend; must be installed and authenticated)
-- **Optional**: `GITHUB_TOKEN` env var for higher rate limits (5000 vs 60 req/hour)
