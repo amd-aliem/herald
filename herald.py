@@ -1323,12 +1323,16 @@ Start directly with "**TL;DR:**"."""
 
     def generate_digest(self, group_names: Optional[List[str]] = None,
                          repositories: Optional[List[str]] = None,
-                         time_window_days: Optional[int] = None) -> str:
+                         time_window_days: Optional[int] = None,
+                         team_name: Optional[str] = None) -> str:
         """Generate digest across groups. Returns combined markdown output."""
         all_summaries_failed = True
 
         # If --repos is used, create a temporary single group
         if repositories:
+            team_context = {}
+            if team_name:
+                team_context["name"] = team_name
             temp_group = {
                 "name": "cli-repos",
                 "sources": [
@@ -1337,7 +1341,7 @@ Start directly with "**TL;DR:**"."""
                         "repositories": repositories,
                     }
                 ],
-                "team_context": {},
+                "team_context": team_context,
             }
             groups_to_process = [temp_group]
         elif group_names:
@@ -1393,6 +1397,10 @@ def main():
     parser.add_argument(
         '--repos',
         help='Comma-separated list of repositories (owner/repo). Overrides configured groups.'
+    )
+    parser.add_argument(
+        '--team-name',
+        help='Team name for ad-hoc --repos runs (improves AI summary quality)'
     )
     parser.add_argument(
         '--days',
@@ -1467,7 +1475,8 @@ def main():
     output = herald.generate_digest(
         group_names=args.group,
         repositories=repositories,
-        time_window_days=args.days
+        time_window_days=args.days,
+        team_name=args.team_name
     )
 
     # Output summary
