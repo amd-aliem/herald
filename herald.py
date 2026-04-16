@@ -478,8 +478,10 @@ AI_BACKEND_REGISTRY: Dict[str, type] = {
 class Herald:
     """Main orchestrator for fetching activity and generating digests."""
 
-    def __init__(self, config_path: Optional[str] = None, force_refresh: bool = False):
+    def __init__(self, config_path: Optional[str] = None, force_refresh: bool = False,
+                 dry_run: bool = False):
         self.force_refresh = force_refresh
+        self.dry_run = dry_run
         self.cache_dir = Path(__file__).parent / ".cache"
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_ttl = 3600
@@ -1106,8 +1108,12 @@ Start directly with "### Summary"."""
         if not all_activity:
             return f"No activity found for group {group_name}.\n", True
 
-        # Save detailed report
-        self.save_detailed_report(group_name, all_activity, time_window_days)
+        # Save detailed report (skip in dry-run mode)
+        if self.dry_run:
+            logger.info("[dry-run] Would save detailed report for group '%s'",
+                        group_name)
+        else:
+            self.save_detailed_report(group_name, all_activity, time_window_days)
 
         # Build output
         short_date = datetime.now().strftime('%b %d, %Y')
@@ -1115,12 +1121,20 @@ Start directly with "### Summary"."""
         output = f"# {repo_names} Digest - {short_date}\n"
         output += f"*Group: {group_name}*\n\n"
 
-        # Generate AI summary across all repos in this group
-        summary = self.generate_summary(all_activity, team_context, group_name)
-        summary_failed = (not summary or summary.startswith(RAW_ACTIVITY_HEADER))
+        # Generate AI summary across all repos in this group (skip in dry-run mode)
+        if self.dry_run:
+            logger.info("[dry-run] Would call AI backend to summarize %d repo(s)",
+                        len(all_activity))
+            summary = None
+            summary_failed = True
+        else:
+            summary = self.generate_summary(all_activity, team_context, group_name)
+            summary_failed = (not summary or summary.startswith(RAW_ACTIVITY_HEADER))
 
         if not summary_failed:
             output += summary + "\n\n"
+        elif self.dry_run:
+            output += "_[dry-run] AI summary skipped_\n\n"
         else:
             output += "_AI summary unavailable - see detailed report for raw data_\n\n"
 
@@ -1232,6 +1246,11 @@ def main():
         help='Force regenerate summaries, ignoring cache'
     )
     parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Fetch activity but skip AI summarization, report saving, and Teams posting'
+    )
+    parser.add_argument(
         '--teams',
         action='store_true',
         help='Post digest to Microsoft Teams via Power Automate webhook'
@@ -1265,7 +1284,8 @@ def main():
     setup_logging(verbose=args.verbose, quiet=args.quiet)
 
     # Initialize
-    herald = Herald(config_path=args.config, force_refresh=args.force)
+    herald = Herald(config_path=args.config, force_refresh=args.force,
+                    dry_run=args.dry_run)
 
     # List groups and exit
     if args.list_groups:
@@ -1295,7 +1315,11 @@ def main():
 
     # Post to Teams if requested
     if args.teams:
-        if herald.all_summaries_failed:
+        if args.dry_run:
+            webhooks = [g.get("teams_webhook_url") for g in herald.groups
+                        if g.get("teams_webhook_url")]
+            logger.info("[dry-run] Would post to %d Teams webhook(s)", len(webhooks))
+        elif herald.all_summaries_failed:
             logger.warning("Skipping Teams post: AI summary generation failed.")
         else:
             # Post to each group's webhook
