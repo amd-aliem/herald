@@ -858,8 +858,25 @@ class Herald:
             prompt += f"--- {repo} ---\n\n"
 
             commits = activity.get("commits", [])
-            prompt += f"COMMITS ({len(commits)}):\n"
-            for commit in commits[:20]:
+            pulls = activity.get("pulls", [])
+
+            # Deduplicate: collect SHAs covered by merged PRs so they are not
+            # repeated in both the COMMITS and PULL REQUESTS sections
+            pr_shas = set()
+            for pr in pulls:
+                if pr.get("merge_commit_sha"):
+                    pr_shas.add(pr["merge_commit_sha"])
+                if pr.get("head", {}).get("sha"):
+                    pr_shas.add(pr["head"]["sha"])
+
+            deduped_commits = [c for c in commits if c["sha"] not in pr_shas]
+            skipped = len(commits) - len(deduped_commits)
+            if skipped:
+                logger.debug("Deduplicated %d commits already covered by PRs in %s",
+                             skipped, repo)
+
+            prompt += f"COMMITS ({len(deduped_commits)}):\n"
+            for commit in deduped_commits[:20]:
                 sha = commit['sha'][:7]
                 message = commit['commit']['message'].split('\n')[0][:100]
                 author = commit['commit']['author']['name']
@@ -867,7 +884,6 @@ class Herald:
                 prompt += f"- {sha}: {message} by {author} on {date}\n"
             prompt += "\n"
 
-            pulls = activity.get("pulls", [])
             prompt += f"PULL REQUESTS ({len(pulls)}):\n"
             for pr in pulls[:30]:
                 state = "merged" if pr.get('merged_at') else pr['state']
