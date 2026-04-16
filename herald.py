@@ -200,6 +200,31 @@ class GitHubSource(ActivitySource):
             logger.error("Request failed for %s: %s", url, e)
             return None
 
+    def github_request_paginated(self, url: str, params: Optional[Dict] = None,
+                                    max_pages: int = 5) -> List[Dict]:
+        """Fetch paginated GitHub API results using page numbers.
+
+        Fetches up to max_pages of results. Stops early when a page
+        returns fewer items than per_page (indicating the last page).
+        """
+        all_results: List[Dict] = []
+        page_params = dict(params or {})
+        per_page = int(page_params.get("per_page", 100))
+
+        for page in range(1, max_pages + 1):
+            page_params["page"] = page
+            data = self.github_request(url, page_params)
+
+            if data is None or not isinstance(data, list):
+                break
+
+            all_results.extend(data)
+
+            if len(data) < per_page:
+                break  # Last page
+
+        return all_results
+
     # -- per-activity-type fetchers --
 
     def fetch_commits(self, repo: str, since: datetime) -> List[Dict]:
@@ -245,8 +270,8 @@ class GitHubSource(ActivitySource):
             "per_page": 100
         }
 
-        data = self.github_request(url, params)
-        if data is None:
+        data = self.github_request_paginated(url, params)
+        if not data:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
                 logger.debug("Using stale cache for pull requests")
@@ -279,8 +304,8 @@ class GitHubSource(ActivitySource):
             "per_page": 100
         }
 
-        data = self.github_request(url, params)
-        if data is None:
+        data = self.github_request_paginated(url, params)
+        if not data:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
                 logger.debug("Using stale cache for issues")
