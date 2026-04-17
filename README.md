@@ -23,7 +23,9 @@ Copy the example config and create your group config:
 ```bash
 cp herald.config.example.json herald.config.json
 cp groups/example.json groups/my-team.json
-# Edit groups/my-team.json with your repositories, team context, and webhook URL
+# Edit groups/my-team.json with your repositories and team context
+cp secrets/example.json secrets/my-team.json
+# Edit secrets/my-team.json with your webhook URL
 ```
 
 ### Run
@@ -82,12 +84,11 @@ python herald.py -q          # WARNING level only
 
 ## Configuration
 
-Herald splits configuration into two layers:
+Herald splits configuration into three layers:
 
 - **`herald.config.json`** -- structural config (defaults + group stubs). Committed to the repo.
-- **`groups/*.json`** -- per-group configs with team context, repositories, and webhook URLs. Gitignored (except `groups/example.json`).
-
-This keeps secrets (webhook URLs) and team-specific data out of version control.
+- **`groups/*.json`** -- per-group configs with team context and repositories. Gitignored (except `groups/example.json`).
+- **`secrets/*.json`** -- per-group secrets (webhook URLs). Gitignored (except `secrets/example.json`). Auto-discovered by group name.
 
 ### File structure
 
@@ -97,6 +98,9 @@ herald.config.example.json  <-- committed, shows full structure
 groups/
   example.json              <-- committed, template for new groups
   my-team.json              <-- gitignored, your team's config
+secrets/
+  example.json              <-- committed, template for secrets
+  my-team.json              <-- gitignored, your team's secrets
 ```
 
 ### herald.config.json (committed)
@@ -118,7 +122,7 @@ Contains defaults and group stubs that reference external config files:
 
 ### Group config file (gitignored)
 
-Each group file contains sources, team context, and optional webhook URL:
+Each group file contains sources and team context:
 
 ```json
 {
@@ -137,7 +141,16 @@ Each group file contains sources, team context, and optional webhook URL:
     "name": "My Team",
     "focus_areas": ["Area your team cares about"],
     "priorities": ["Top priority (shown first in AI summaries)"]
-  },
+  }
+}
+```
+
+### Secrets file (gitignored)
+
+Secrets are stored separately in `secrets/<group-name>.json`. Herald auto-discovers them by matching the filename to the group name:
+
+```json
+{
   "teams_webhook_url": "https://..."
 }
 ```
@@ -146,7 +159,9 @@ Each group file contains sources, team context, and optional webhook URL:
 
 ```bash
 cp groups/example.json groups/my-team.json
-# Edit groups/my-team.json with your repositories, team context, and webhook URL
+# Edit groups/my-team.json with your repositories and team context
+cp secrets/example.json secrets/my-team.json
+# Edit secrets/my-team.json with your webhook URL
 ```
 
 Then add a stub to `herald.config.json`:
@@ -174,7 +189,7 @@ Then add a stub to `herald.config.json`:
 | `groups[].team_context.name` | Team display name used in prompts |
 | `groups[].team_context.focus_areas` | List of focus areas injected into the AI prompt |
 | `groups[].team_context.priorities` | Ordered list; first entry is flagged as critical priority |
-| `groups[].teams_webhook_url` | Power Automate webhook URL (optional) |
+| `secrets/<group>.teams_webhook_url` | Power Automate webhook URL (stored in `secrets/<group-name>.json`) |
 
 ### Inline groups
 
@@ -205,6 +220,8 @@ Herald settings can be overridden via environment variables, useful for CI/cron 
 | `HERALD_MAX_COMMITS` | `defaults.max_commits` | `HERALD_MAX_COMMITS=50` |
 | `HERALD_TEAMS_WEBHOOK` | `teams_webhook_url` (all groups) | `HERALD_TEAMS_WEBHOOK=https://...` |
 | `GITHUB_TOKEN` | GitHub API authentication | `GITHUB_TOKEN=ghp_...` |
+
+Webhook URL precedence (highest to lowest): `HERALD_TEAMS_WEBHOOK` env var > `secrets/<group-name>.json` > inline group config.
 
 ## Sample Output
 

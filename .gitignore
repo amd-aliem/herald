@@ -9,3 +9,5 @@ venv/
 herald.config.json
 groups/*.json
 !groups/example.json
+secrets/*.json
+!secrets/example.json

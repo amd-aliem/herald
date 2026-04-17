@@ -38,6 +38,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 RAW_ACTIVITY_HEADER = "**Raw Activity Data:**"
+SECRET_FIELD_NAMES = {"teams_webhook_url"}
 
 
 def setup_logging(verbose: bool = False, quiet: bool = False):
@@ -732,6 +733,39 @@ class Herald:
             if not group.get("teams_webhook_url"):
                 group["teams_webhook_url"] = webhook
 
+    def _load_group_secrets(self, group: Dict[str, Any]):
+        """Load secrets from secrets/<group-name>.json and merge into the group dict.
+
+        Looks for a secrets file matching the group name. Only recognized secret
+        fields (SECRET_FIELD_NAMES) are merged. Existing values in the group dict
+        are not overwritten — this allows inline config to still work, though
+        secrets/ is the preferred location.
+        """
+        group_name = group.get("name")
+        if not group_name:
+            return
+
+        secrets_path = self.config_dir / "secrets" / f"{group_name}.json"
+        if not secrets_path.exists():
+            return
+
+        try:
+            with open(secrets_path, 'r') as f:
+                secrets = json.load(f)
+        except Exception as e:
+            logger.warning("Failed to load secrets from %s: %s", secrets_path, e)
+            return
+
+        merged = 0
+        for field in SECRET_FIELD_NAMES:
+            if field in secrets and secrets[field]:
+                group[field] = secrets[field]
+                merged += 1
+
+        if merged:
+            logger.debug("Loaded %d secret(s) for group '%s' from %s",
+                         merged, group_name, secrets_path)
+
     def resolve_groups(self) -> List[Dict[str, Any]]:
         """Parse groups from config. Wraps flat config as single group for backward compat."""
         config = self.config
@@ -761,6 +795,8 @@ class Herald:
                                        "(group '%s' will have no sources)",
                                        ext_path, group_name)
                 resolved.append(group)
+            for g in resolved:
+                self._load_group_secrets(g)
             self._apply_env_webhook(resolved)
             return resolved
 
@@ -787,6 +823,8 @@ class Herald:
             if webhook:
                 group["teams_webhook_url"] = webhook
             groups = [group]
+            for g in groups:
+                self._load_group_secrets(g)
             self._apply_env_webhook(groups)
             return groups
 
@@ -842,6 +880,44 @@ class Herald:
                       f"(AI summaries will be generic)")
                 issues += 1
 
+        # Check secrets directory
+        secrets_dir = self.config_dir / "secrets"
+        if secrets_dir.is_dir():
+            secret_files = list(secrets_dir.glob("*.json"))
+            non_example = [f for f in secret_files if f.name != "example.json"]
+            if non_example:
+                names = ", ".join(f.stem for f in non_example)
+                print(f"OK: secrets/ directory found with files for: {names}")
+            else:
+                print("OK: secrets/ directory exists (no group secret files yet)")
+        else:
+            print("WARN: secrets/ directory not found. Create it to store "
+                  "webhook URLs separately from group configs.")
+            issues += 1
+
+        # Warn about webhook URLs embedded in group configs
+        for group in self.groups:
+            name = group.get("name", "unnamed")
+            # Check if the group's external config file contains a webhook URL
+            ext_conf = next(
+                (g for g in self.config.get("groups", [])
+                 if g.get("name") == name and "config_file" in g),
+                None
+            )
+            if ext_conf:
+                ext_path = self.config_dir / ext_conf["config_file"]
+                if ext_path.exists():
+                    try:
+                        with open(ext_path, 'r') as f:
+                            ext_data = json.load(f)
+                        if ext_data.get("teams_webhook_url"):
+                            print(f"WARN: Group '{name}' has teams_webhook_url in "
+                                  f"{ext_path.name}. Move it to secrets/{name}.json "
+                                  f"instead.")
+                            issues += 1
+                    except Exception:
+                        pass
+
         # Check AI backend
         if self.ai_backend.validate():
             print(f"OK: AI backend ({self.ai_backend.backend_type}) is available")
@@ -882,7 +958,8 @@ class Herald:
                 source_summary.append(f"{src_type}: {', '.join(repos)}")
             team = group.get("team_context", {}).get("name", "")
             team_str = f" (team: {team})" if team else ""
-            print(f"  - {name}{team_str}")
+            webhook_str = ", webhook: configured" if group.get("teams_webhook_url") else ""
+            print(f"  - {name}{team_str}{webhook_str}")
             for s in source_summary:
                 print(f"      {s}")
 

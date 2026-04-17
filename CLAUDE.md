@@ -56,6 +56,7 @@ The entire application is `herald.py`, structured into three classes plus a CLI 
 ### Key methods on `Herald`
 
 - `load_config()` — JSON config with CLI arg overrides; falls back to legacy config with warning
+- `_load_group_secrets()` — loads `secrets/<group-name>.json` and merges recognized secret fields into group dict
 - `resolve_groups()` — parses groups array or wraps flat config as single "default" group
 - `list_groups()` — prints configured groups
 - `generate_group_digest(group)` — processes one group end-to-end
@@ -74,10 +75,11 @@ The entire application is `herald.py`, structured into three classes plus a CLI 
 
 ## Configuration
 
-Config is split into two layers to keep secrets and team-specific data out of version control:
+Config is split into three layers to keep secrets and team-specific data out of version control:
 
 - **`herald.config.json`** (committed) — defaults + group stubs with `config_file` references
-- **`groups/*.json`** (gitignored, except `groups/example.json`) — per-group configs with sources, team context, and webhook URLs
+- **`groups/*.json`** (gitignored, except `groups/example.json`) — per-group configs with sources and team context
+- **`secrets/*.json`** (gitignored, except `secrets/example.json`) — per-group secrets (webhook URLs), auto-discovered by group name
 
 ### herald.config.json (structural only)
 
@@ -96,9 +98,14 @@ Config is split into two layers to keep secrets and team-specific data out of ve
 - `sources[].filters.exclude_titles` — regex patterns to exclude by title/subject
 - `sources[].filters.exclude_labels` — exact-match label names to exclude (PRs/issues)
 - `team_context.name`, `.focus_areas`, `.priorities` — injected into Claude prompts
-- `teams_webhook_url` — Power Automate webhook (optional)
 
 Groups can also be defined inline in `herald.config.json` (see `herald.config.example.json`). Flat legacy configs with top-level `repositories` are auto-wrapped as a single group.
+
+### Secrets files (secrets/*.json)
+
+- Auto-discovered by group name: `secrets/<group-name>.json`
+- `teams_webhook_url` — Power Automate webhook URL
+- Precedence: `HERALD_TEAMS_WEBHOOK` env var > `secrets/<group>.json` > inline group config
 
 ### Environment variables
 

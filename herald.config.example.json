@@ -39,8 +39,7 @@
           "Your team's top priority (shown first in AI summaries)",
           "Secondary priority"
         ]
-      },
-      "teams_webhook_url": ""
+      }
     }
   ]
 }
