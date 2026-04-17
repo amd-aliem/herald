@@ -62,6 +62,40 @@ RAW_ACTIVITY_HEADER = "**Raw Activity Data:**"
 SECRET_FIELD_NAMES = {"teams_webhook_url"}
 
 
+class _ColorFormatter(logging.Formatter):
+    """Compact, color-coded log formatter for interactive terminal use."""
+
+    COLORS = {
+        logging.DEBUG:    "\033[2m",       # dim
+        logging.INFO:     "\033[36m",      # cyan
+        logging.WARNING:  "\033[33m",      # yellow
+        logging.ERROR:    "\033[31m",      # red
+        logging.CRITICAL: "\033[1;31m",    # bold red
+    }
+    SYMBOLS = {
+        logging.DEBUG:    "  ",
+        logging.INFO:     "  ",
+        logging.WARNING:  "  ",
+        logging.ERROR:    "  ",
+        logging.CRITICAL: "  ",
+    }
+    RESET = "\033[0m"
+    BOLD  = "\033[1m"
+    DIM   = "\033[2m"
+
+    def __init__(self, use_color: bool = True):
+        super().__init__()
+        self.use_color = use_color and sys.stderr.isatty()
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if not self.use_color:
+            return f"{record.levelname}: {msg}"
+        color = self.COLORS.get(record.levelno, "")
+        sym = self.SYMBOLS.get(record.levelno, "")
+        return f"{color}{sym}{msg}{self.RESET}"
+
+
 def setup_logging(verbose: bool = False, quiet: bool = False):
     """Configure logging for Herald.
 
@@ -77,9 +111,9 @@ def setup_logging(verbose: bool = False, quiet: bool = False):
     else:
         herald_logger.setLevel(logging.INFO)
 
-    # stderr handler — concise format for interactive use
+    # stderr handler — color-coded format for interactive use
     stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    stderr_handler.setFormatter(_ColorFormatter())
     herald_logger.addHandler(stderr_handler)
 
 
@@ -131,6 +165,8 @@ class ActivitySource(ABC):
         try:
             with open(cache_path, 'r') as f:
                 return json.load(f)
+        except FileNotFoundError:
+            return None
         except Exception as e:
             logger.warning("Failed to load cache from %s: %s", cache_path, e)
             return None
@@ -183,8 +219,7 @@ class GitHubSource(ActivitySource):
                 logger.error("Invalid repository format: %s (expected owner/repo)", repo)
                 valid = False
         if valid and not os.environ.get('GITHUB_TOKEN'):
-            logger.info("Tip: set GITHUB_TOKEN for higher API rate limits "
-                        "(5000 vs 60 requests/hour)")
+            logger.info("Tip: export GITHUB_TOKEN=... for higher rate limits")
         return valid
 
     # -- GitHub API helpers --
@@ -391,7 +426,7 @@ class GitHubSource(ActivitySource):
         # Releases are not filtered (they are rarely noise)
 
         if removed:
-            logger.info("  Filtered out %d items via exclude patterns", removed)
+            logger.info("  Filtered %d items", removed)
 
         return activity
 
@@ -401,7 +436,7 @@ class GitHubSource(ActivitySource):
         """Fetch activity for all configured repositories."""
         results = []
         for repo in self.repositories:
-            logger.info("Fetching activity for %s...", repo)
+            logger.info("Fetching %s ...", repo)
 
             activity: Dict[str, Any] = {
                 "repository": repo,
@@ -411,21 +446,27 @@ class GitHubSource(ActivitySource):
 
             if "commits" in self.activity_types:
                 activity["commits"] = self.fetch_commits(repo, since)
-                logger.info("  Found %d commits", len(activity['commits']))
 
             if "pulls" in self.activity_types:
                 activity["pulls"] = self.fetch_pulls(repo, since)
-                logger.info("  Found %d pull requests", len(activity['pulls']))
 
             if "issues" in self.activity_types:
                 activity["issues"] = self.fetch_issues(repo, since)
-                logger.info("  Found %d issues", len(activity['issues']))
 
             if "releases" in self.activity_types:
                 activity["releases"] = self.fetch_releases(repo, since)
-                logger.info("  Found %d releases", len(activity['releases']))
 
             activity = self.apply_filters(activity)
+
+            # Single summary line for this repo
+            parts = []
+            for key, label in [("commits", "commits"), ("pulls", "PRs"),
+                               ("issues", "issues"), ("releases", "releases")]:
+                if key in activity:
+                    parts.append(f"{len(activity[key])} {label}")
+            if parts:
+                logger.info("  %s", ", ".join(parts))
+
             results.append(activity)
 
         return results
@@ -488,8 +529,7 @@ class ClaudeCLIBackend(AIBackend):
             return None
 
         try:
-            logger.info("Calling Claude CLI...")
-            logger.info("Prompt length: %d characters", len(prompt))
+            logger.info("Calling Claude CLI (%d chars) ...", len(prompt))
 
             result = subprocess.run(
                 ['claude', '-'],
@@ -521,8 +561,7 @@ class ClaudeCLIBackend(AIBackend):
                 self._save_debug_prompt(prompt, label, "empty")
                 return None
 
-            logger.info("Claude summary generated successfully (%d characters)",
-                        len(output))
+            logger.info("Summary ready (%d chars)", len(output))
             return output
 
         except subprocess.TimeoutExpired:
@@ -639,7 +678,7 @@ class Herald:
                 with open(config_path, 'r') as f:
                     user_config = json.load(f)
                     default_config.update(user_config)
-                    logger.info("Loaded config from: %s", config_path)
+                    logger.info("Config: %s", config_path)
             except Exception as e:
                 logger.warning("Failed to load config from %s: %s",
                                config_path, e)
@@ -1124,7 +1163,7 @@ Start directly with "**TL;DR:**"."""
                 logger.info("Using cached summary for %s", group_name)
                 return cached
 
-        logger.info("Generating AI summary for %s...", group_name)
+        logger.info("Generating AI summary for %s ...", group_name)
 
         prompt = self.format_prompt(activity_list, team_context)
         summary = self.ai_backend.summarize(prompt, group_name)
@@ -1239,7 +1278,7 @@ Start directly with "**TL;DR:**"."""
         with open(output_file, 'w') as f:
             f.write(output)
 
-        logger.info("Detailed report saved to: %s", output_file)
+        logger.info("Report saved: %s", output_file)
 
     def format_raw_data(self, activity_list: List[Dict[str, Any]]) -> str:
         """Format raw activity data as markdown (fallback when Claude CLI is unavailable)."""
@@ -1343,7 +1382,7 @@ Start directly with "**TL;DR:**"."""
             logger.error("No webhook URL provided.")
             return False
 
-        logger.info("Posting digest to Microsoft Teams...")
+        logger.info("Posting to Teams ...")
 
         card_body = self.markdown_to_adaptive_card_blocks(digest_output)
 
@@ -1372,7 +1411,7 @@ Start directly with "**TL;DR:**"."""
             )
 
             if response.status_code in (200, 202):
-                logger.info("Successfully posted digest to Teams channel.")
+                logger.info("Posted to Teams successfully")
                 return True
             else:
                 logger.error("Error posting to Teams: HTTP %d", response.status_code)
@@ -3740,7 +3779,7 @@ def main():
     if args.output:
         with open(args.output, 'w') as f:
             f.write(output)
-        logger.info("Summary written to: %s", args.output)
+        logger.info("Output saved: %s", args.output)
     else:
         # Digest output goes to stdout (not logging) so it can be piped/redirected
         print(output)
