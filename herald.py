@@ -11,6 +11,7 @@ import os
 import argparse
 import subprocess
 import hashlib
+import io
 import shutil
 import re
 from abc import ABC, abstractmethod
@@ -31,6 +32,26 @@ try:
 except ImportError:
     print("Error: 'python-dateutil' module not found. Install with: pip install python-dateutil")
     sys.exit(1)
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.prompt import Prompt, IntPrompt, Confirm
+    from rich.syntax import Syntax
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+try:
+    from textual.app import App, ComposeResult
+    from textual.screen import Screen, ModalScreen
+    from textual.widgets import Header, Footer, Static, DataTable, ListView, ListItem, Label, Input
+    from textual.containers import Container, VerticalScroll
+    from textual.binding import Binding
+    HAS_TEXTUAL = True
+except ImportError:
+    HAS_TEXTUAL = False
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +81,16 @@ def setup_logging(verbose: bool = False, quiet: bool = False):
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     herald_logger.addHandler(stderr_handler)
+
+
+def _is_cache_valid(cache_path: Path, cache_ttl: int, force_refresh: bool) -> bool:
+    """Check if a cache file exists and is within its TTL."""
+    if force_refresh:
+        return False
+    if not cache_path.exists():
+        return False
+    age = datetime.now().timestamp() - cache_path.stat().st_mtime
+    return age < cache_ttl
 
 
 # ---------------------------------------------------------------------------
@@ -94,12 +125,7 @@ class ActivitySource(ABC):
         return self.cache_dir / f"{key_safe}_{activity_type}_{date_str}.json"
 
     def is_cache_valid(self, cache_path: Path) -> bool:
-        if self.force_refresh:
-            return False
-        if not cache_path.exists():
-            return False
-        age = datetime.now().timestamp() - cache_path.stat().st_mtime
-        return age < self.cache_ttl
+        return _is_cache_valid(cache_path, self.cache_ttl, self.force_refresh)
 
     def load_cache(self, cache_path: Path) -> Optional[Any]:
         try:
@@ -228,131 +254,79 @@ class GitHubSource(ActivitySource):
 
     # -- per-activity-type fetchers --
 
-    def fetch_commits(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "commits")
+    def _fetch_with_cache(self, repo: str, activity_type: str, url: str,
+                          params: Dict, paginated: bool = False,
+                          filter_fn=None) -> List[Dict]:
+        """Generic fetch-with-cache pattern used by all activity type fetchers."""
+        cache_path = self.get_cache_path(repo, activity_type)
 
         if self.is_cache_valid(cache_path):
             cached_data = self.load_cache(cache_path)
             if cached_data:
-                logger.debug("Using cached commits data")
+                logger.debug("Using cached %s data", activity_type)
                 return cached_data
 
-        url = f"https://api.github.com/repos/{repo}/commits"
-        params = {
-            "since": since.isoformat(),
-            "per_page": self.max_commits
-        }
+        if paginated:
+            data = self.github_request_paginated(url, params)
+            fetch_failed = not data
+        else:
+            data = self.github_request(url, params)
+            fetch_failed = data is None
 
-        data = self.github_request(url, params)
-        if data is None:
+        if fetch_failed:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
-                logger.debug("Using stale cache for commits")
+                logger.debug("Using stale cache for %s", activity_type)
                 return stale_cache
             return []
+
+        if filter_fn:
+            data = filter_fn(data)
 
         self.save_cache(cache_path, data)
         return data
 
+    def fetch_commits(self, repo: str, since: datetime) -> List[Dict]:
+        url = f"https://api.github.com/repos/{repo}/commits"
+        params = {"since": since.isoformat(), "per_page": self.max_commits}
+        return self._fetch_with_cache(repo, "commits", url, params)
+
     def fetch_pulls(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "pulls")
-
-        if self.is_cache_valid(cache_path):
-            cached_data = self.load_cache(cache_path)
-            if cached_data:
-                logger.debug("Using cached pull requests data")
-                return cached_data
-
         url = f"https://api.github.com/repos/{repo}/pulls"
-        params = {
-            "state": "all",
-            "sort": "updated",
-            "direction": "desc",
-            "per_page": 100
-        }
-
-        data = self.github_request_paginated(url, params)
-        if not data:
-            stale_cache = self.load_cache(cache_path)
-            if stale_cache:
-                logger.debug("Using stale cache for pull requests")
-                return stale_cache
-            return []
-
-        filtered = []
-        for pr in data:
-            updated_at = date_parser.parse(pr['updated_at'])
-            if updated_at >= since:
-                filtered.append(pr)
-
-        self.save_cache(cache_path, filtered)
-        return filtered
+        params = {"state": "all", "sort": "updated",
+                  "direction": "desc", "per_page": 100}
+        return self._fetch_with_cache(
+            repo, "pulls", url, params, paginated=True,
+            filter_fn=lambda data: [
+                pr for pr in data
+                if date_parser.parse(pr['updated_at']) >= since
+            ],
+        )
 
     def fetch_issues(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "issues")
-
-        if self.is_cache_valid(cache_path):
-            cached_data = self.load_cache(cache_path)
-            if cached_data:
-                logger.debug("Using cached issues data")
-                return cached_data
-
         url = f"https://api.github.com/repos/{repo}/issues"
-        params = {
-            "state": "all",
-            "sort": "updated",
-            "direction": "desc",
-            "per_page": 100
-        }
-
-        data = self.github_request_paginated(url, params)
-        if not data:
-            stale_cache = self.load_cache(cache_path)
-            if stale_cache:
-                logger.debug("Using stale cache for issues")
-                return stale_cache
-            return []
-
-        filtered = []
-        for issue in data:
-            if 'pull_request' in issue:
-                continue
-            updated_at = date_parser.parse(issue['updated_at'])
-            if updated_at >= since:
-                filtered.append(issue)
-
-        self.save_cache(cache_path, filtered)
-        return filtered
+        params = {"state": "all", "sort": "updated",
+                  "direction": "desc", "per_page": 100}
+        return self._fetch_with_cache(
+            repo, "issues", url, params, paginated=True,
+            filter_fn=lambda data: [
+                issue for issue in data
+                if 'pull_request' not in issue
+                and date_parser.parse(issue['updated_at']) >= since
+            ],
+        )
 
     def fetch_releases(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "releases")
-
-        if self.is_cache_valid(cache_path):
-            cached_data = self.load_cache(cache_path)
-            if cached_data:
-                logger.debug("Using cached releases data")
-                return cached_data
-
         url = f"https://api.github.com/repos/{repo}/releases"
         params = {"per_page": 10}
-
-        data = self.github_request(url, params)
-        if data is None:
-            stale_cache = self.load_cache(cache_path)
-            if stale_cache:
-                logger.debug("Using stale cache for releases")
-                return stale_cache
-            return []
-
-        filtered = []
-        for release in data:
-            if release['published_at']:
-                published_at = date_parser.parse(release['published_at'])
-                if published_at >= since:
-                    filtered.append(release)
-
-        self.save_cache(cache_path, filtered)
-        return filtered
+        return self._fetch_with_cache(
+            repo, "releases", url, params,
+            filter_fn=lambda data: [
+                r for r in data
+                if r['published_at']
+                and date_parser.parse(r['published_at']) >= since
+            ],
+        )
 
     # -- filtering --
 
@@ -400,31 +374,19 @@ class GitHubSource(ActivitySource):
             ]
             removed += original - len(activity["commits"])
 
-        # Filter PRs
-        if "pulls" in activity:
-            original = len(activity["pulls"])
-            activity["pulls"] = [
-                p for p in activity["pulls"]
-                if not (
-                    _match_author(p.get("user", {}).get("login", ""))
-                    or _match_title(p.get("title", ""))
-                    or _match_labels(p)
-                )
-            ]
-            removed += original - len(activity["pulls"])
-
-        # Filter issues
-        if "issues" in activity:
-            original = len(activity["issues"])
-            activity["issues"] = [
-                i for i in activity["issues"]
-                if not (
-                    _match_author(i.get("user", {}).get("login", ""))
-                    or _match_title(i.get("title", ""))
-                    or _match_labels(i)
-                )
-            ]
-            removed += original - len(activity["issues"])
+        # Filter PRs and issues (same fields: user.login, title, labels)
+        for key in ("pulls", "issues"):
+            if key in activity:
+                original = len(activity[key])
+                activity[key] = [
+                    item for item in activity[key]
+                    if not (
+                        _match_author(item.get("user", {}).get("login", ""))
+                        or _match_title(item.get("title", ""))
+                        or _match_labels(item)
+                    )
+                ]
+                removed += original - len(activity[key])
 
         # Releases are not filtered (they are rarely noise)
 
@@ -691,32 +653,23 @@ class Herald:
 
         return default_config
 
+    @staticmethod
+    def _parse_env_int(var_name: str, config_key: str, target: Dict[str, Any]):
+        """Read an integer from env var into target dict, warning on bad values."""
+        value = os.environ.get(var_name)
+        if value:
+            try:
+                target[config_key] = int(value)
+                logger.info("%s=%s overrides %s", var_name, value, config_key)
+            except ValueError:
+                logger.warning("%s=%s is not a valid integer, ignoring",
+                               var_name, value)
+
     def _apply_env_overrides(self):
-        """Apply HERALD_* environment variable overrides to config.
-
-        Supported variables:
-        - HERALD_DAYS: override defaults.time_window_days (integer)
-        - HERALD_MAX_COMMITS: override defaults.max_commits (integer)
-        - HERALD_TEAMS_WEBHOOK: set webhook URL for groups that lack one
-        """
+        """Apply HERALD_* environment variable overrides to config."""
         defaults = self.config.setdefault("defaults", {})
-
-        days = os.environ.get("HERALD_DAYS")
-        if days:
-            try:
-                defaults["time_window_days"] = int(days)
-                logger.info("HERALD_DAYS=%s overrides time_window_days", days)
-            except ValueError:
-                logger.warning("HERALD_DAYS=%s is not a valid integer, ignoring", days)
-
-        max_commits = os.environ.get("HERALD_MAX_COMMITS")
-        if max_commits:
-            try:
-                defaults["max_commits"] = int(max_commits)
-                logger.info("HERALD_MAX_COMMITS=%s overrides max_commits", max_commits)
-            except ValueError:
-                logger.warning("HERALD_MAX_COMMITS=%s is not a valid integer, ignoring",
-                               max_commits)
+        self._parse_env_int("HERALD_DAYS", "time_window_days", defaults)
+        self._parse_env_int("HERALD_MAX_COMMITS", "max_commits", defaults)
 
         webhook = os.environ.get("HERALD_TEAMS_WEBHOOK")
         if webhook:
@@ -1184,12 +1137,7 @@ Start directly with "**TL;DR:**"."""
             return self.format_raw_data(activity_list)
 
     def is_cache_valid(self, cache_path: Path) -> bool:
-        if self.force_refresh:
-            return False
-        if not cache_path.exists():
-            return False
-        age = datetime.now().timestamp() - cache_path.stat().st_mtime
-        return age < self.cache_ttl
+        return _is_cache_valid(cache_path, self.cache_ttl, self.force_refresh)
 
     def load_cache_text(self, cache_path: Path) -> Optional[str]:
         try:
@@ -1599,6 +1547,2049 @@ Start directly with "**TL;DR:**"."""
 
 
 # ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def _capture_validation_output(config_path_str: Optional[str]) -> str:
+    """Run Herald.validate() and capture its print output."""
+    herald_logger = logging.getLogger("herald")
+    old_level = herald_logger.level
+    herald_logger.setLevel(logging.ERROR)
+    try:
+        h = Herald(config_path=config_path_str)
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            h.validate()
+        finally:
+            sys.stdout = old_stdout
+        return buf.getvalue()
+    finally:
+        herald_logger.setLevel(old_level)
+
+
+def _colorize_validation_line(line: str, use_markers: bool = False) -> str:
+    """Colorize a single validation output line with Rich markup."""
+    if line.startswith("OK:"):
+        if use_markers:
+            return f"[green] [OK] {line[3:]}[/green]"
+        return f"[green]{line}[/green]"
+    if line.startswith("WARN:"):
+        if use_markers:
+            return f"[yellow] [!!] {line[5:]}[/yellow]"
+        return f"[yellow]{line}[/yellow]"
+    if line.startswith("FAIL:"):
+        if use_markers:
+            return f"[red] [XX] {line[5:]}[/red]"
+        return f"[red]{line}[/red]"
+    if line.startswith("All checks passed"):
+        return f"\n[bold green]{line}[/bold green]"
+    if line.startswith("Passed with"):
+        return f"\n[bold yellow]{line}[/bold yellow]"
+    if line.startswith("Validation failed"):
+        return f"\n[bold red]{line}[/bold red]"
+    return line
+
+
+# ---------------------------------------------------------------------------
+# ConfigStore — shared file I/O for ConfigManager and ConfigApp
+# ---------------------------------------------------------------------------
+
+class ConfigStore:
+    """Shared config file I/O, secret management, and group resolution."""
+
+    DEFAULT_CONFIG = {
+        "defaults": {
+            "time_window_days": 14,
+            "max_commits": 20,
+            "activity_types": ["commits", "pulls", "issues", "releases"],
+            "ai_backend": {
+                "type": "claude-cli",
+                "timeout": 600
+            }
+        },
+        "groups": []
+    }
+
+    def _init_config(self, config_path: Optional[str] = None):
+        """Initialize config state. Call from subclass __init__."""
+        self.config_path = self._resolve_config_path(config_path)
+        self.config_dir = self.config_path.parent if self.config_path else Path.cwd()
+        self.config = self._load_config()
+
+    def _resolve_config_path(self, config_path: Optional[str]) -> Optional[Path]:
+        if config_path:
+            return Path(config_path).resolve()
+        for path in ["./herald.config.json",
+                     str(Path.home() / ".herald.config.json")]:
+            if Path(path).exists():
+                return Path(path).resolve()
+        return None
+
+    def _load_config(self) -> Dict[str, Any]:
+        if self.config_path and self.config_path.exists():
+            return self._load_json_file(self.config_path)
+        return dict(self.DEFAULT_CONFIG)
+
+    def _load_json_file(self, path: Path) -> Dict[str, Any]:
+        with open(path, 'r') as f:
+            return json.load(f)
+
+    def _save_json_file(self, path: Path, data: Dict[str, Any]):
+        serialized = json.dumps(data, indent=2) + "\n"
+        json.loads(serialized)  # round-trip validate
+        if path.exists():
+            self._backup_file(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".tmp")
+        with open(tmp_path, 'w') as f:
+            f.write(serialized)
+        os.replace(str(tmp_path), str(path))
+
+    def _backup_file(self, path: Path):
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_path = path.with_suffix(f".backup.{timestamp}.json")
+        shutil.copy2(str(path), str(backup_path))
+
+    def _mask_secret(self, value: str) -> str:
+        if not value or len(value) <= 20:
+            return "****"
+        return value[:12] + "****" + value[-4:]
+
+    def _load_group_config(self, group_entry: Dict[str, Any]) -> Dict[str, Any]:
+        if "config_file" in group_entry:
+            ext_path = self.config_dir / group_entry["config_file"]
+            if ext_path.exists():
+                ext = self._load_json_file(ext_path)
+                ext["name"] = group_entry.get("name", ext_path.stem)
+                return ext
+        return dict(group_entry)
+
+    def _load_secrets(self, group_name: str) -> Dict[str, Any]:
+        secrets_path = self.config_dir / "secrets" / f"{group_name}.json"
+        if secrets_path.exists():
+            return self._load_json_file(secrets_path)
+        return {}
+
+    def _save_secrets(self, group_name: str, secrets: Dict[str, Any]):
+        secrets_path = self.config_dir / "secrets" / f"{group_name}.json"
+        self._save_json_file(secrets_path, secrets)
+
+    def _save_main_config(self):
+        if not self.config_path:
+            self.config_path = Path.cwd() / "herald.config.json"
+            self.config_dir = self.config_path.parent
+        self._save_json_file(self.config_path, self.config)
+
+    def _save_group_config(self, group_entry: Dict[str, Any],
+                            full_config: Dict[str, Any], is_external: bool):
+        if is_external:
+            ext_path = self.config_dir / group_entry["config_file"]
+            save_data = {k: v for k, v in full_config.items() if k != "name"}
+            self._save_json_file(ext_path, save_data)
+        else:
+            groups = self.config.get("groups", [])
+            for i, g in enumerate(groups):
+                if g.get("name") == group_entry.get("name"):
+                    groups[i] = full_config
+                    break
+            self._save_main_config()
+
+
+# ---------------------------------------------------------------------------
+# ConfigManager — interactive configuration TUI
+# ---------------------------------------------------------------------------
+
+class ConfigManager(ConfigStore):
+    """Interactive configuration manager using rich TUI."""
+
+    def __init__(self, config_path: Optional[str] = None):
+        self.console = Console()
+        self._init_config(config_path)
+
+    def _backup_file(self, path: Path):
+        super()._backup_file(path)
+        self.console.print(f"  Backup saved: {path.name}", style="dim")
+
+    def _save_main_config(self):
+        super()._save_main_config()
+        self.console.print(f"[green]Saved {self.config_path.name}[/green]")
+
+    def _save_secrets(self, group_name: str, secrets: Dict[str, Any]):
+        super()._save_secrets(group_name, secrets)
+        self.console.print(f"[green]Saved secrets/{group_name}.json[/green]")
+
+    def _save_group_config(self, group_entry: Dict[str, Any],
+                            full_config: Dict[str, Any], is_external: bool):
+        super()._save_group_config(group_entry, full_config, is_external)
+        if is_external:
+            self.console.print(f"[green]Saved {group_entry['config_file']}[/green]")
+
+    def _numbered_menu(self, title: str, options: List[str],
+                       allow_back: bool = True) -> Optional[int]:
+        self.console.print()
+        self.console.print(f"[bold]{title}[/bold]")
+        for i, option in enumerate(options, 1):
+            self.console.print(f"  {i}. {option}")
+        if allow_back:
+            self.console.print(f"  0. Back")
+
+        choices = [str(i) for i in range(0 if allow_back else 1, len(options) + 1)]
+        try:
+            choice = IntPrompt.ask("Select", choices=choices, show_choices=False)
+        except KeyboardInterrupt:
+            return None
+        if choice == 0 and allow_back:
+            return None
+        return choice - 1
+
+    # -- Main menu --
+
+    def run(self):
+        self.console.print(Panel(
+            "[bold]Herald Configuration Manager[/bold]\n"
+            f"Config: {self.config_path or '(none - will create new)'}",
+            border_style="blue"
+        ))
+
+        while True:
+            choice = self._numbered_menu("Main Menu", [
+                "Edit Defaults",
+                "Manage Groups",
+                "Manage Secrets",
+                "Validate Configuration",
+                "Exit",
+            ], allow_back=False)
+
+            if choice is None or choice == 4:
+                self.console.print("[dim]Goodbye.[/dim]")
+                break
+            try:
+                if choice == 0:
+                    self._edit_defaults()
+                elif choice == 1:
+                    self._manage_groups()
+                elif choice == 2:
+                    self._manage_secrets()
+                elif choice == 3:
+                    self._validate_config()
+            except KeyboardInterrupt:
+                self.console.print()
+                continue
+
+    # -- 1. Edit Defaults --
+
+    def _edit_defaults(self):
+        while True:
+            defaults = self.config.setdefault("defaults", {})
+            ai = defaults.get("ai_backend", {})
+
+            table = Table(title="Current Defaults")
+            table.add_column("Setting", style="cyan")
+            table.add_column("Value", style="green")
+            table.add_row("time_window_days", str(defaults.get("time_window_days", 14)))
+            table.add_row("max_commits", str(defaults.get("max_commits", 20)))
+            table.add_row("activity_types",
+                          ", ".join(defaults.get("activity_types",
+                                                  ["commits", "pulls", "issues", "releases"])))
+            table.add_row("ai_backend.type", ai.get("type", "claude-cli"))
+            table.add_row("ai_backend.timeout", str(ai.get("timeout", 600)))
+            self.console.print(table)
+
+            choice = self._numbered_menu("Edit which setting?", [
+                "time_window_days",
+                "max_commits",
+                "activity_types",
+                "ai_backend.type",
+                "ai_backend.timeout",
+            ])
+            if choice is None:
+                return
+
+            try:
+                if choice == 0:
+                    val = IntPrompt.ask("time_window_days",
+                                        default=defaults.get("time_window_days", 14))
+                    defaults["time_window_days"] = val
+                elif choice == 1:
+                    val = IntPrompt.ask("max_commits",
+                                        default=defaults.get("max_commits", 20))
+                    defaults["max_commits"] = val
+                elif choice == 2:
+                    all_types = ["commits", "pulls", "issues", "releases"]
+                    current = defaults.get("activity_types", all_types)
+                    self.console.print(f"  Current: {', '.join(current)}")
+                    self.console.print(f"  Available: {', '.join(all_types)}")
+                    raw = Prompt.ask("Enter types (comma-separated)",
+                                    default=",".join(current))
+                    parsed = [t.strip() for t in raw.split(",") if t.strip()]
+                    invalid = [t for t in parsed if t not in all_types]
+                    if invalid:
+                        self.console.print(f"[red]Invalid types: {', '.join(invalid)}[/red]")
+                        continue
+                    defaults["activity_types"] = parsed
+                elif choice == 3:
+                    available = list(AI_BACKEND_REGISTRY.keys())
+                    val = Prompt.ask("ai_backend type",
+                                    default=ai.get("type", "claude-cli"),
+                                    choices=available)
+                    defaults.setdefault("ai_backend", {})["type"] = val
+                elif choice == 4:
+                    val = IntPrompt.ask("ai_backend timeout (seconds)",
+                                        default=ai.get("timeout", 600))
+                    defaults.setdefault("ai_backend", {})["timeout"] = val
+            except KeyboardInterrupt:
+                self.console.print()
+                continue
+
+            if Confirm.ask("Save changes?"):
+                self._save_main_config()
+
+    # -- 2. Manage Groups --
+
+    def _manage_groups(self):
+        while True:
+            groups = self.config.get("groups", [])
+
+            table = Table(title="Configured Groups")
+            table.add_column("#", style="dim")
+            table.add_column("Name", style="cyan")
+            table.add_column("Source", style="green")
+            table.add_column("Repos", style="yellow")
+            table.add_column("Config File", style="dim")
+
+            for i, g in enumerate(groups, 1):
+                full = self._load_group_config(g)
+                sources = full.get("sources", [])
+                src_type = sources[0].get("type", "?") if sources else "-"
+                repos = []
+                for s in sources:
+                    repos.extend(s.get("repositories", []))
+                config_file = g.get("config_file", "(inline)")
+                table.add_row(str(i), g.get("name", "unnamed"), src_type,
+                              str(len(repos)), config_file)
+
+            self.console.print(table)
+
+            opts = [f"View/Edit {g.get('name', 'unnamed')}" for g in groups]
+            opts.append("Create new group")
+            if groups:
+                opts.append("Delete group")
+
+            choice = self._numbered_menu("Groups", opts)
+            if choice is None:
+                return
+
+            if choice < len(groups):
+                self._edit_group(choice)
+            elif choice == len(groups):
+                self._create_group()
+            elif choice == len(groups) + 1:
+                self._delete_group()
+
+    def _edit_group(self, index: int):
+        groups = self.config.get("groups", [])
+        group_entry = groups[index]
+        group_name = group_entry.get("name", "unnamed")
+        is_external = "config_file" in group_entry
+        full_config = self._load_group_config(group_entry)
+
+        while True:
+            choice = self._numbered_menu(f"Edit Group: {group_name}", [
+                "Edit sources (repositories, filters)",
+                "Edit team context",
+                "View full config (JSON)",
+            ])
+            if choice is None:
+                return
+
+            if choice == 0:
+                self._edit_group_sources(group_entry, full_config, is_external)
+                # Reload after edit
+                full_config = self._load_group_config(group_entry)
+            elif choice == 1:
+                self._edit_group_team_context(group_entry, full_config, is_external)
+                full_config = self._load_group_config(group_entry)
+            elif choice == 2:
+                display = dict(full_config)
+                display.pop("name", None)  # name is on the stub
+                syntax = Syntax(json.dumps(display, indent=2), "json",
+                                theme="monokai", line_numbers=True)
+                self.console.print(Panel(syntax,
+                                         title=f"Group: {group_name}",
+                                         border_style="blue"))
+
+    def _edit_group_sources(self, group_entry: Dict[str, Any],
+                             full_config: Dict[str, Any], is_external: bool):
+        sources = full_config.setdefault("sources", [])
+        if not sources:
+            sources.append({"type": "github", "repositories": []})
+            full_config["sources"] = sources
+
+        while True:
+            # Show current repos across all sources
+            for si, src in enumerate(sources):
+                repos = src.get("repositories", [])
+                filters = src.get("filters", {})
+                self.console.print(f"\n[bold]Source {si + 1}[/bold] (type: {src.get('type', 'github')})")
+                if repos:
+                    for r in repos:
+                        self.console.print(f"  - {r}")
+                else:
+                    self.console.print("  (no repositories)")
+                if filters:
+                    if filters.get("exclude_authors"):
+                        self.console.print(f"  Exclude authors: {', '.join(filters['exclude_authors'])}")
+                    if filters.get("exclude_titles"):
+                        self.console.print(f"  Exclude titles: {', '.join(filters['exclude_titles'])}")
+                    if filters.get("exclude_labels"):
+                        self.console.print(f"  Exclude labels: {', '.join(filters['exclude_labels'])}")
+
+            choice = self._numbered_menu("Sources", [
+                "Add repository",
+                "Remove repository",
+                "Edit filters",
+            ])
+            if choice is None:
+                return
+
+            try:
+                if choice == 0:
+                    repo = Prompt.ask("Repository (owner/repo)")
+                    parts = repo.strip().split('/')
+                    if len(parts) != 2 or not all(parts):
+                        self.console.print("[red]Invalid format. Use owner/repo[/red]")
+                        continue
+                    # Add to first source
+                    repos = sources[0].setdefault("repositories", [])
+                    if repo in repos:
+                        self.console.print("[yellow]Already present[/yellow]")
+                        continue
+                    repos.append(repo)
+                    if Confirm.ask("Save changes?"):
+                        self._save_group_config(group_entry, full_config, is_external)
+
+                elif choice == 1:
+                    all_repos = []
+                    for src in sources:
+                        all_repos.extend(src.get("repositories", []))
+                    if not all_repos:
+                        self.console.print("[yellow]No repositories to remove[/yellow]")
+                        continue
+                    idx = self._numbered_menu("Remove which repository?", all_repos)
+                    if idx is None:
+                        continue
+                    repo_to_remove = all_repos[idx]
+                    if Confirm.ask(f"Remove [bold]{repo_to_remove}[/bold]?"):
+                        for src in sources:
+                            repos = src.get("repositories", [])
+                            if repo_to_remove in repos:
+                                repos.remove(repo_to_remove)
+                                break
+                        if Confirm.ask("Save changes?"):
+                            self._save_group_config(group_entry, full_config, is_external)
+
+                elif choice == 2:
+                    self._edit_filters(sources[0], group_entry, full_config, is_external)
+
+            except KeyboardInterrupt:
+                self.console.print()
+                continue
+
+    def _edit_filters(self, source: Dict[str, Any], group_entry: Dict[str, Any],
+                       full_config: Dict[str, Any], is_external: bool):
+        filters = source.setdefault("filters", {})
+        while True:
+            self.console.print()
+            self.console.print("[bold]Current Filters[/bold]")
+            self.console.print(f"  exclude_authors: {filters.get('exclude_authors', [])}")
+            self.console.print(f"  exclude_titles:  {filters.get('exclude_titles', [])}")
+            self.console.print(f"  exclude_labels:  {filters.get('exclude_labels', [])}")
+
+            choice = self._numbered_menu("Edit filters", [
+                "Set exclude_authors",
+                "Set exclude_titles",
+                "Set exclude_labels",
+                "Clear all filters",
+            ])
+            if choice is None:
+                return
+
+            try:
+                if choice == 0:
+                    current = ", ".join(filters.get("exclude_authors", []))
+                    raw = Prompt.ask("Exclude authors (comma-separated)", default=current)
+                    filters["exclude_authors"] = [a.strip() for a in raw.split(",")
+                                                   if a.strip()]
+                elif choice == 1:
+                    current = ", ".join(filters.get("exclude_titles", []))
+                    raw = Prompt.ask("Exclude title patterns (comma-separated regex)",
+                                    default=current)
+                    patterns = [p.strip() for p in raw.split(",") if p.strip()]
+                    # Validate regex patterns
+                    valid = True
+                    for p in patterns:
+                        try:
+                            re.compile(p)
+                        except re.error as e:
+                            self.console.print(f"[red]Invalid regex '{p}': {e}[/red]")
+                            valid = False
+                    if not valid:
+                        continue
+                    filters["exclude_titles"] = patterns
+                elif choice == 2:
+                    current = ", ".join(filters.get("exclude_labels", []))
+                    raw = Prompt.ask("Exclude labels (comma-separated)", default=current)
+                    filters["exclude_labels"] = [l.strip() for l in raw.split(",")
+                                                  if l.strip()]
+                elif choice == 3:
+                    if Confirm.ask("Clear all filters?"):
+                        filters.clear()
+
+                if Confirm.ask("Save changes?"):
+                    # Clean up empty filters dict
+                    if not any(filters.values()):
+                        source.pop("filters", None)
+                    self._save_group_config(group_entry, full_config, is_external)
+
+            except KeyboardInterrupt:
+                self.console.print()
+                continue
+
+    def _edit_group_team_context(self, group_entry: Dict[str, Any],
+                                  full_config: Dict[str, Any], is_external: bool):
+        tc = full_config.setdefault("team_context", {})
+        while True:
+            self.console.print()
+            self.console.print("[bold]Team Context[/bold]")
+            self.console.print(f"  name:        {tc.get('name', '(not set)')}")
+            self.console.print(f"  focus_areas: {tc.get('focus_areas', [])}")
+            self.console.print(f"  priorities:  {tc.get('priorities', [])}")
+
+            choice = self._numbered_menu("Edit team context", [
+                "Set team name",
+                "Set focus areas",
+                "Set priorities",
+            ])
+            if choice is None:
+                return
+
+            try:
+                if choice == 0:
+                    val = Prompt.ask("Team name", default=tc.get("name", ""))
+                    tc["name"] = val
+                elif choice == 1:
+                    current = ", ".join(tc.get("focus_areas", []))
+                    raw = Prompt.ask("Focus areas (comma-separated)", default=current)
+                    tc["focus_areas"] = [a.strip() for a in raw.split(",") if a.strip()]
+                elif choice == 2:
+                    current = ", ".join(tc.get("priorities", []))
+                    raw = Prompt.ask("Priorities (comma-separated, first = highest)",
+                                    default=current)
+                    tc["priorities"] = [p.strip() for p in raw.split(",") if p.strip()]
+
+                if Confirm.ask("Save changes?"):
+                    self._save_group_config(group_entry, full_config, is_external)
+
+            except KeyboardInterrupt:
+                self.console.print()
+                continue
+
+    def _create_group(self):
+        try:
+            name = Prompt.ask("Group name").strip()
+            if not name:
+                self.console.print("[red]Name cannot be empty[/red]")
+                return
+
+            # Check for duplicate
+            existing = [g.get("name") for g in self.config.get("groups", [])]
+            if name in existing:
+                self.console.print(f"[red]Group '{name}' already exists[/red]")
+                return
+
+            use_external = Confirm.ask(
+                f"Create external config file (groups/{name}.json)?", default=True)
+
+            if use_external:
+                # Create the external file
+                ext_config = {
+                    "sources": [
+                        {
+                            "type": "github",
+                            "repositories": []
+                        }
+                    ],
+                    "team_context": {
+                        "name": "",
+                        "focus_areas": [],
+                        "priorities": []
+                    }
+                }
+                ext_path = self.config_dir / "groups" / f"{name}.json"
+                self._save_json_file(ext_path, ext_config)
+                self.console.print(f"[green]Created groups/{name}.json[/green]")
+
+                # Add stub to main config
+                stub = {
+                    "name": name,
+                    "config_file": f"groups/{name}.json"
+                }
+                self.config.setdefault("groups", []).append(stub)
+            else:
+                # Inline group
+                inline = {
+                    "name": name,
+                    "sources": [
+                        {
+                            "type": "github",
+                            "repositories": []
+                        }
+                    ],
+                    "team_context": {
+                        "name": "",
+                        "focus_areas": [],
+                        "priorities": []
+                    }
+                }
+                self.config.setdefault("groups", []).append(inline)
+
+            self._save_main_config()
+            self.console.print(f"[green]Group '{name}' created[/green]")
+
+        except KeyboardInterrupt:
+            self.console.print()
+
+    def _delete_group(self):
+        groups = self.config.get("groups", [])
+        if not groups:
+            self.console.print("[yellow]No groups to delete[/yellow]")
+            return
+
+        names = [g.get("name", "unnamed") for g in groups]
+        idx = self._numbered_menu("Delete which group?", names)
+        if idx is None:
+            return
+
+        group = groups[idx]
+        name = group.get("name", "unnamed")
+
+        if not Confirm.ask(f"[red]Delete group '{name}'?[/red]"):
+            return
+
+        # Remove from config
+        groups.pop(idx)
+
+        # Optionally delete external file
+        if "config_file" in group:
+            ext_path = self.config_dir / group["config_file"]
+            if ext_path.exists():
+                if Confirm.ask(f"Also delete {group['config_file']}?"):
+                    self._backup_file(ext_path)
+                    ext_path.unlink()
+                    self.console.print(f"[green]Deleted {group['config_file']}[/green]")
+
+        # Warn about secrets
+        secrets_path = self.config_dir / "secrets" / f"{name}.json"
+        if secrets_path.exists():
+            self.console.print(
+                f"[yellow]Note: secrets/{name}.json still exists. "
+                f"Remove manually if no longer needed.[/yellow]"
+            )
+
+        self._save_main_config()
+        self.console.print(f"[green]Group '{name}' removed[/green]")
+
+    # -- 3. Manage Secrets --
+
+    def _manage_secrets(self):
+        while True:
+            groups = self.config.get("groups", [])
+
+            table = Table(title="Group Secrets")
+            table.add_column("Group", style="cyan")
+            table.add_column("Webhook URL", style="green")
+            table.add_column("Source", style="dim")
+
+            for g in groups:
+                name = g.get("name", "unnamed")
+                secrets = self._load_secrets(name)
+                webhook = secrets.get("teams_webhook_url", "")
+                if webhook:
+                    table.add_row(name, self._mask_secret(webhook),
+                                  f"secrets/{name}.json")
+                else:
+                    table.add_row(name, "(not set)", "-")
+
+            self.console.print(table)
+
+            if not groups:
+                self.console.print("[yellow]No groups configured. "
+                                   "Create a group first.[/yellow]")
+                return
+
+            names = [g.get("name", "unnamed") for g in groups]
+            choice = self._numbered_menu("Set/update webhook for which group?", names)
+            if choice is None:
+                return
+
+            group_name = names[choice]
+            secrets = self._load_secrets(group_name)
+            current = secrets.get("teams_webhook_url", "")
+
+            try:
+                if current:
+                    self.console.print(f"  Current: {self._mask_secret(current)}")
+                    action = self._numbered_menu("Action", [
+                        "Update webhook URL",
+                        "Remove webhook URL",
+                    ])
+                    if action is None:
+                        continue
+                    if action == 1:
+                        if Confirm.ask("Remove webhook URL?"):
+                            secrets.pop("teams_webhook_url", None)
+                            if secrets:
+                                self._save_secrets(group_name, secrets)
+                            else:
+                                # Remove empty secrets file
+                                secrets_path = self.config_dir / "secrets" / f"{group_name}.json"
+                                if secrets_path.exists():
+                                    self._backup_file(secrets_path)
+                                    secrets_path.unlink()
+                                    self.console.print(
+                                        f"[green]Removed secrets/{group_name}.json[/green]")
+                        continue
+                    # Fall through to set URL
+
+                url = Prompt.ask("Webhook URL").strip()
+                if not url:
+                    self.console.print("[yellow]Skipped (empty URL)[/yellow]")
+                    continue
+
+                secrets["teams_webhook_url"] = url
+                self._save_secrets(group_name, secrets)
+
+            except KeyboardInterrupt:
+                self.console.print()
+                continue
+
+    # -- 4. Validate Configuration --
+
+    def _validate_config(self):
+        self.console.print()
+        self.console.print(Panel("[bold]Validating Configuration[/bold]",
+                                  border_style="blue"))
+        try:
+            config_path_str = str(self.config_path) if self.config_path else None
+            output = _capture_validation_output(config_path_str)
+            for line in output.strip().split('\n'):
+                self.console.print(_colorize_validation_line(line))
+        except Exception as e:
+            self.console.print(f"[red]Validation error: {e}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# ConfigApp — Textual TUI for configuration management
+# ---------------------------------------------------------------------------
+
+if HAS_TEXTUAL:
+
+    class VimDataTable(DataTable):
+        """DataTable with vim hjkl keys mapped to arrow equivalents."""
+
+        BINDINGS = [
+            Binding("j", "cursor_down", "Down", show=False),
+            Binding("k", "cursor_up", "Up", show=False),
+            Binding("h", "cursor_left", "Left", show=False),
+            Binding("l", "cursor_right", "Right", show=False),
+        ]
+
+    class VimListView(ListView):
+        """ListView with vim jk keys mapped to arrow equivalents."""
+
+        BINDINGS = [
+            Binding("j", "cursor_down", "Down", show=False),
+            Binding("k", "cursor_up", "Up", show=False),
+        ]
+
+    class ConfirmModal(ModalScreen[bool]):
+        """Modal dialog for yes/no confirmation.  y to confirm, n/Escape to cancel."""
+
+        ESCAPE_TO_MINIMIZE = False
+
+        BINDINGS = [
+            Binding("y", "confirm", "Yes", show=False),
+            Binding("n", "cancel", "No", show=False),
+            Binding("escape", "cancel", "Cancel", show=False),
+            Binding("ctrl+c", "cancel", "Cancel", priority=True, show=False),
+        ]
+
+        DEFAULT_CSS = """
+        ConfirmModal {
+            align: center middle;
+        }
+        ConfirmModal > Container {
+            width: 60;
+            height: auto;
+            max-height: 14;
+            border: heavy $error;
+            background: $surface;
+            padding: 1 2;
+            border-title-color: $error;
+            border-title-style: bold;
+        }
+        ConfirmModal > Container > #confirm-icon {
+            width: 100%;
+            content-align: center middle;
+            color: $warning;
+            margin-bottom: 1;
+        }
+        ConfirmModal > Container > #confirm-msg {
+            width: 100%;
+            content-align: center middle;
+            margin-bottom: 1;
+        }
+        ConfirmModal > Container > #confirm-hint {
+            width: 100%;
+            content-align: center middle;
+            color: $text-muted;
+        }
+        """
+
+        def __init__(self, message: str) -> None:
+            super().__init__()
+            self._message = message
+
+        def compose(self) -> ComposeResult:
+            with Container(id="confirm-dialog"):
+                yield Label("! WARNING !", id="confirm-icon")
+                yield Label(self._message, id="confirm-msg")
+                yield Label("y = confirm  /  n or Ctrl-C = cancel", id="confirm-hint")
+
+        def on_mount(self) -> None:
+            self.query_one("#confirm-dialog", Container).border_title = "Confirm"
+
+        def action_confirm(self) -> None:
+            self.dismiss(True)
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
+    class InputModal(ModalScreen[str]):
+        """Generic single-field text input modal.  Enter to submit, Escape/Ctrl-C to cancel."""
+
+        ESCAPE_TO_MINIMIZE = False
+
+        BINDINGS = [
+            Binding("ctrl+c", "cancel", "Cancel", priority=True, show=False),
+        ]
+
+        DEFAULT_CSS = """
+        InputModal {
+            align: center middle;
+        }
+        InputModal > Container {
+            width: 70;
+            height: auto;
+            max-height: 20;
+            border: heavy $accent;
+            background: $surface;
+            padding: 1 2;
+            border-title-color: $accent;
+            border-title-style: bold;
+        }
+        InputModal Input {
+            margin: 1 0;
+        }
+        InputModal > Container > #input-hint {
+            width: 100%;
+            content-align: center middle;
+            color: $text-muted;
+        }
+        """
+
+        def __init__(self, title: str, label: str, default: str = "",
+                     placeholder: str = "") -> None:
+            super().__init__()
+            self._title = title
+            self._label = label
+            self._default = default
+            self._placeholder = placeholder
+
+        def compose(self) -> ComposeResult:
+            with Container(id="input-dialog"):
+                yield Label(self._label, id="input-label")
+                yield Input(
+                    value=self._default,
+                    placeholder=self._placeholder,
+                    id="input-field",
+                )
+                yield Label("Enter = save  /  Esc or Ctrl-C = cancel", id="input-hint")
+
+        def on_mount(self) -> None:
+            self.query_one("#input-dialog", Container).border_title = self._title
+            self.query_one("#input-field").focus()
+
+        def _key_escape(self) -> None:
+            self.dismiss("")
+
+        def action_cancel(self) -> None:
+            self.dismiss("")
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            self.dismiss(event.value)
+
+    class SelectModal(ModalScreen[str]):
+        """Generic option picker modal."""
+
+        DEFAULT_CSS = """
+        SelectModal {
+            align: center middle;
+        }
+        SelectModal > Container {
+            width: 70;
+            height: auto;
+            max-height: 20;
+            border: heavy $accent;
+            background: $surface;
+            padding: 1 2;
+            border-title-color: $accent;
+            border-title-style: bold;
+        }
+        SelectModal > Container > #select-list {
+            height: auto;
+            max-height: 12;
+            margin: 1 0;
+        }
+        """
+
+        BINDINGS = [
+            Binding("b", "cancel", "Cancel"),
+            Binding("escape", "cancel", "Cancel", show=False),
+            Binding("ctrl+c", "cancel", "Cancel", priority=True, show=False),
+        ]
+
+        def __init__(self, title: str,
+                     options: list) -> None:
+            super().__init__()
+            self._title = title
+            self._options = options  # list of (value, label)
+
+        def compose(self) -> ComposeResult:
+            with Container(id="select-dialog"):
+                yield VimListView(
+                    *[ListItem(Label(label), id=f"opt-{value}")
+                      for value, label in self._options],
+                    id="select-list",
+                )
+
+        def on_mount(self) -> None:
+            dialog = self.query_one("#select-dialog", Container)
+            dialog.border_title = self._title
+
+        def on_list_view_selected(self, event: ListView.Selected) -> None:
+            item_id = event.item.id
+            if item_id and item_id.startswith("opt-"):
+                self.dismiss(item_id[4:])
+
+        def action_cancel(self) -> None:
+            self.dismiss("")
+
+    class MainMenuScreen(Screen):
+        """Main menu with navigation options."""
+
+        BINDINGS = [
+            Binding("q", "quit", "Quit"),
+            Binding("b", "quit", "Quit"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            config_label = str(self.app.config_path) if self.app.config_path else "(none - will create new)"
+            yield Static(
+                "[bold bright_cyan]"
+                "  _  _ ___ ___    _   _    ___  \n"
+                " | || | __| _ \\  /_\\ | |  |   \\ \n"
+                " | __ | _||   / / _ \\| |__| |) |\n"
+                " |_||_|___|_|_\\/_/ \\_\\____|___/ \n"
+                "[/bold bright_cyan]\n"
+                f"  [dim]Config:[/dim] [italic]{config_label}[/italic]",
+                id="banner",
+            )
+            yield VimListView(
+                ListItem(Label("[bold]Edit Defaults[/bold]        [dim]Time window, commit limits, AI backend[/dim]"), id="defaults"),
+                ListItem(Label("[bold]Manage Groups[/bold]        [dim]Add, edit, or remove repo groups[/dim]"), id="groups"),
+                ListItem(Label("[bold]Manage Secrets[/bold]       [dim]Teams webhook URLs per group[/dim]"), id="secrets"),
+                ListItem(Label("[bold]Validate Config[/bold]      [dim]Check config + prerequisites[/dim]"), id="validate"),
+                ListItem(Label("[dim]Exit[/dim]"), id="exit"),
+                id="main-menu",
+            )
+            yield Static("[dim]Enter[/dim] select  [dim]hjkl[/dim] navigate  [dim]b[/dim] exit", id="help")
+            yield Footer()
+
+        def on_list_view_selected(self, event: ListView.Selected) -> None:
+            item_id = event.item.id
+            if item_id == "defaults":
+                self.app.push_screen(DefaultsScreen())
+            elif item_id == "groups":
+                self.app.push_screen(GroupsScreen())
+            elif item_id == "secrets":
+                self.app.push_screen(SecretsScreen())
+            elif item_id == "validate":
+                self.app.push_screen(ValidateScreen())
+            elif item_id == "exit":
+                self.app.exit()
+
+        def action_quit(self) -> None:
+            self.app.exit()
+
+    class DefaultsScreen(Screen):
+        """View and edit default settings."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+            Binding("e", "edit_setting_key", "Edit"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static("[bold bright_cyan]>> Defaults[/bold bright_cyan]", id="screen-title")
+            table = VimDataTable(id="defaults-table", zebra_stripes=True)
+            table.add_columns("Setting", "Value")
+            yield table
+            yield Static("[dim]e[/dim] edit  [dim]hjkl[/dim] navigate  [dim]b[/dim] back", id="help")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self._refresh_table()
+
+        def _refresh_table(self) -> None:
+            table = self.query_one("#defaults-table", DataTable)
+            table.clear()
+            defaults = self.app.config.get("defaults", {})
+            ai = defaults.get("ai_backend", {})
+            table.add_row("time_window_days", str(defaults.get("time_window_days", 14)))
+            table.add_row("max_commits", str(defaults.get("max_commits", 20)))
+            table.add_row("activity_types",
+                          ", ".join(defaults.get("activity_types",
+                                                 ["commits", "pulls", "issues", "releases"])))
+            table.add_row("ai_backend.type", ai.get("type", "claude-cli"))
+            table.add_row("ai_backend.timeout", str(ai.get("timeout", 600)))
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            self._edit_by_row(event.cursor_row)
+
+        def action_edit_setting_key(self) -> None:
+            table = self.query_one("#defaults-table", DataTable)
+            self._edit_by_row(table.cursor_row)
+
+        def _edit_by_row(self, row_index: int) -> None:
+            settings = [
+                "time_window_days", "max_commits", "activity_types",
+                "ai_backend.type", "ai_backend.timeout"
+            ]
+            if row_index < 0 or row_index >= len(settings):
+                return
+            setting = settings[row_index]
+            self._edit_setting(setting)
+
+        def _edit_setting(self, setting: str) -> None:
+            defaults = self.app.config.setdefault("defaults", {})
+            ai = defaults.setdefault("ai_backend", {})
+
+            if setting in ("time_window_days", "max_commits", "ai_backend.timeout"):
+                labels = {
+                    "time_window_days": "Time window (days)",
+                    "max_commits": "Max commits per repo",
+                    "ai_backend.timeout": "AI backend timeout (seconds)",
+                }
+                if setting == "ai_backend.timeout":
+                    current = str(ai.get("timeout", 600))
+                else:
+                    current = str(defaults.get(setting, 14 if setting == "time_window_days" else 20))
+
+                def on_int_input(value: str) -> None:
+                    if not value:
+                        return
+                    try:
+                        int_val = int(value)
+                    except ValueError:
+                        self.notify("Must be an integer", severity="error")
+                        return
+                    if setting == "ai_backend.timeout":
+                        ai["timeout"] = int_val
+                    else:
+                        defaults[setting] = int_val
+                    self.app._save_main_config()
+                    self.notify(f"Saved {setting} = {int_val}")
+                    self._refresh_table()
+
+                self.app.push_screen(
+                    InputModal(setting, labels[setting], default=current),
+                    on_int_input,
+                )
+
+            elif setting == "activity_types":
+                all_types = ["commits", "pulls", "issues", "releases"]
+                current = defaults.get("activity_types", all_types)
+
+                def on_types_input(value: str) -> None:
+                    if not value:
+                        return
+                    parsed = [t.strip() for t in value.split(",") if t.strip()]
+                    invalid = [t for t in parsed if t not in all_types]
+                    if invalid:
+                        self.notify(
+                            f"Invalid types: {', '.join(invalid)}",
+                            severity="error",
+                        )
+                        return
+                    defaults["activity_types"] = parsed
+                    self.app._save_main_config()
+                    self.notify(f"Saved activity_types")
+                    self._refresh_table()
+
+                self.app.push_screen(
+                    InputModal("Activity Types",
+                               "Comma-separated (commits,pulls,issues,releases)",
+                               default=",".join(current)),
+                    on_types_input,
+                )
+
+            elif setting == "ai_backend.type":
+                available = list(AI_BACKEND_REGISTRY.keys())
+                options = [(k, k) for k in available]
+
+                def on_type_select(value: str) -> None:
+                    if not value:
+                        return
+                    ai["type"] = value
+                    self.app._save_main_config()
+                    self.notify(f"Saved ai_backend.type = {value}")
+                    self._refresh_table()
+
+                self.app.push_screen(
+                    SelectModal("AI Backend", options), on_type_select
+                )
+
+        def action_go_back(self) -> None:
+            self.app.pop_screen()
+
+    class GroupsScreen(Screen):
+        """List and manage groups."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+            Binding("c", "create_group", "Create"),
+            Binding("e", "edit_group", "Edit"),
+            Binding("r", "rename_group", "Rename"),
+            Binding("d", "delete_group", "Delete"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static("[bold bright_cyan]>> Groups[/bold bright_cyan]", id="screen-title")
+            table = VimDataTable(id="groups-table", zebra_stripes=True)
+            table.add_columns("#", "Name", "Source", "Repos", "Config File")
+            yield table
+            yield Static(
+                "[dim]e[/dim] edit  "
+                "[dim]r[/dim] rename  "
+                "[dim]c[/dim] create  "
+                "[dim]d[/dim] delete  "
+                "[dim]hjkl[/dim] navigate  "
+                "[dim]b[/dim] back",
+                id="help",
+            )
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self._refresh_table()
+
+        def _refresh_table(self) -> None:
+            table = self.query_one("#groups-table", DataTable)
+            table.clear()
+            groups = self.app.config.get("groups", [])
+            for i, g in enumerate(groups, 1):
+                full = self.app._load_group_config(g)
+                sources = full.get("sources", [])
+                src_type = sources[0].get("type", "?") if sources else "-"
+                repos = []
+                for s in sources:
+                    repos.extend(s.get("repositories", []))
+                config_file = g.get("config_file", "(inline)")
+                table.add_row(str(i), g.get("name", "unnamed"), src_type,
+                              str(len(repos)), config_file)
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            self._open_group(event.cursor_row)
+
+        def action_edit_group(self) -> None:
+            table = self.query_one("#groups-table", DataTable)
+            self._open_group(table.cursor_row)
+
+        def _open_group(self, row_index: int) -> None:
+            groups = self.app.config.get("groups", [])
+            if 0 <= row_index < len(groups):
+                self.app.push_screen(GroupDetailScreen(row_index))
+
+        def action_create_group(self) -> None:
+            def on_name_input(name: str) -> None:
+                name = name.strip()
+                if not name:
+                    return
+
+                existing = [g.get("name") for g in self.app.config.get("groups", [])]
+                if name in existing:
+                    self.notify(f"Group '{name}' already exists",
+                                severity="error")
+                    return
+
+                def on_config_type(choice: str) -> None:
+                    if not choice:
+                        return  # Cancelled
+
+                    if choice == "external":
+                        ext_config = {
+                            "sources": [{"type": "github", "repositories": []}],
+                            "team_context": {
+                                "name": "",
+                                "focus_areas": [],
+                                "priorities": []
+                            }
+                        }
+                        ext_path = self.app.config_dir / "groups" / f"{name}.json"
+                        self.app._save_json_file(ext_path, ext_config)
+
+                        stub = {"name": name, "config_file": f"groups/{name}.json"}
+                        self.app.config.setdefault("groups", []).append(stub)
+                    else:
+                        inline = {
+                            "name": name,
+                            "sources": [{"type": "github", "repositories": []}],
+                            "team_context": {
+                                "name": "",
+                                "focus_areas": [],
+                                "priorities": []
+                            }
+                        }
+                        self.app.config.setdefault("groups", []).append(inline)
+
+                    self.app._save_main_config()
+                    self.notify(f"Group '{name}' created")
+                    self._refresh_table()
+
+                self.app.push_screen(
+                    SelectModal("Config Storage", [
+                        ("external", f"External file (groups/{name}.json)"),
+                        ("inline", "Inline in herald.config.json"),
+                    ]),
+                    on_config_type,
+                )
+
+            self.app.push_screen(
+                InputModal("Create Group", "Group name",
+                           placeholder="my-team"),
+                on_name_input,
+            )
+
+        def action_rename_group(self) -> None:
+            groups = self.app.config.get("groups", [])
+            if not groups:
+                self.notify("No groups to rename", severity="warning")
+                return
+
+            table = self.query_one("#groups-table", DataTable)
+            row_index = table.cursor_row
+            if row_index < 0 or row_index >= len(groups):
+                return
+
+            group = groups[row_index]
+            old_name = group.get("name", "unnamed")
+
+            def on_name_input(new_name: str) -> None:
+                new_name = new_name.strip()
+                if not new_name or new_name == old_name:
+                    return
+
+                existing = [g.get("name") for g in self.app.config.get("groups", [])]
+                if new_name in existing:
+                    self.notify(f"Group '{new_name}' already exists",
+                                severity="error")
+                    return
+
+                # Re-fetch in case config changed while modal was open
+                current_groups = self.app.config.get("groups", [])
+                if row_index >= len(current_groups):
+                    return
+                grp = current_groups[row_index]
+
+                # Rename external config file if present
+                if "config_file" in grp:
+                    old_path = self.app.config_dir / grp["config_file"]
+                    new_cfg_rel = f"groups/{new_name}.json"
+                    new_path = self.app.config_dir / new_cfg_rel
+                    if old_path.exists():
+                        old_path.rename(new_path)
+                    grp["config_file"] = new_cfg_rel
+
+                # Rename secrets file if present
+                old_secrets = self.app.config_dir / "secrets" / f"{old_name}.json"
+                if old_secrets.exists():
+                    new_secrets = self.app.config_dir / "secrets" / f"{new_name}.json"
+                    old_secrets.rename(new_secrets)
+
+                grp["name"] = new_name
+                self.app._save_main_config()
+                self.notify(f"Renamed '{old_name}' -> '{new_name}'")
+                self._refresh_table()
+
+            self.app.push_screen(
+                InputModal("Rename Group", "New name", default=old_name),
+                on_name_input,
+            )
+
+        def action_delete_group(self) -> None:
+            groups = self.app.config.get("groups", [])
+            if not groups:
+                self.notify("No groups to delete", severity="warning")
+                return
+
+            table = self.query_one("#groups-table", DataTable)
+            row_index = table.cursor_row
+            if row_index < 0 or row_index >= len(groups):
+                return
+
+            group = groups[row_index]
+            name = group.get("name", "unnamed")
+
+            def on_confirm(confirmed: bool) -> None:
+                if not confirmed:
+                    return
+                current_groups = self.app.config.get("groups", [])
+                if row_index >= len(current_groups):
+                    return
+                current_groups.pop(row_index)
+
+                def finish_delete() -> None:
+                    secrets_path = self.app.config_dir / "secrets" / f"{name}.json"
+                    if secrets_path.exists():
+                        self.notify(
+                            f"secrets/{name}.json still exists. Remove manually if unneeded.",
+                            severity="warning",
+                        )
+                    self.app._save_main_config()
+                    self.notify(f"Group '{name}' removed")
+                    self._refresh_table()
+
+                if "config_file" in group:
+                    ext_path = self.app.config_dir / group["config_file"]
+                    if ext_path.exists():
+                        def on_delete_file(delete_it: bool) -> None:
+                            if delete_it:
+                                self.app._backup_file(ext_path)
+                                ext_path.unlink()
+                                self.notify(f"Deleted {group['config_file']}")
+                            finish_delete()
+
+                        self.app.push_screen(
+                            ConfirmModal(f"Also delete {group['config_file']}?"),
+                            on_delete_file,
+                        )
+                        return
+
+                finish_delete()
+
+            self.app.push_screen(
+                ConfirmModal(f"Delete group '{name}'?"), on_confirm
+            )
+
+        def action_go_back(self) -> None:
+            self.app.pop_screen()
+
+    class GroupScreenBase(Screen):
+        """Base class for screens that operate on a single group by index."""
+
+        def __init__(self, group_index: int) -> None:
+            super().__init__()
+            self.group_index = group_index
+
+        def _get_group_name(self) -> str:
+            groups = self.app.config.get("groups", [])
+            return groups[self.group_index].get("name", "unnamed")
+
+        def _get_group_data(self):
+            groups = self.app.config.get("groups", [])
+            group_entry = groups[self.group_index]
+            is_external = "config_file" in group_entry
+            full_config = self.app._load_group_config(group_entry)
+            return group_entry, full_config, is_external
+
+        def action_go_back(self) -> None:
+            self.app.pop_screen()
+
+    class GroupDetailScreen(GroupScreenBase):
+        """View/edit a specific group."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            group_name = self._get_group_name()
+            _, full_config, _ = self._get_group_data()
+            sources = full_config.get("sources", [])
+            repos = []
+            for s in sources:
+                repos.extend(s.get("repositories", []))
+            tc = full_config.get("team_context", {})
+
+            yield Header()
+            yield Static(
+                f"[bold bright_cyan]>> Group: {group_name}[/bold bright_cyan]\n"
+                f"  [dim]Repos:[/dim] {', '.join(repos) if repos else '(none)'}\n"
+                f"  [dim]Team:[/dim]  {tc.get('name') or '(not set)'}",
+                id="group-title",
+            )
+            yield VimListView(
+                ListItem(Label("[bold]Edit sources[/bold]      [dim]Repositories and filters[/dim]"), id="sources"),
+                ListItem(Label("[bold]Edit team context[/bold] [dim]Name, focus areas, priorities[/dim]"), id="team-context"),
+                ListItem(Label("[bold]View config JSON[/bold]  [dim]Read-only rendered view[/dim]"), id="view-json"),
+                id="group-menu",
+            )
+            yield Static("[dim]Enter[/dim] select  [dim]hjkl[/dim] navigate  [dim]b[/dim] back", id="help")
+            yield Footer()
+
+        def on_list_view_selected(self, event: ListView.Selected) -> None:
+            item_id = event.item.id
+            if item_id == "sources":
+                self.app.push_screen(EditSourcesScreen(self.group_index))
+            elif item_id == "team-context":
+                self.app.push_screen(EditTeamContextScreen(self.group_index))
+            elif item_id == "view-json":
+                self.app.push_screen(JsonViewScreen(self.group_index))
+
+    class EditSourcesScreen(GroupScreenBase):
+        """Full screen for managing repositories on a group."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+            Binding("a", "add_repo", "Add repo"),
+            Binding("d", "delete_repo", "Delete repo"),
+            Binding("f", "edit_filters", "Filters"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            group_name = self._get_group_name()
+            yield Header()
+            yield Static(
+                f"[bold bright_cyan]>> Sources: {group_name}[/bold bright_cyan]",
+                id="screen-title",
+            )
+            table = VimDataTable(id="sources-table", zebra_stripes=True)
+            table.add_columns("#", "Repository")
+            yield table
+            yield Static(
+                "[dim]a[/dim] add  "
+                "[dim]d[/dim] delete  "
+                "[dim]f[/dim] filters  "
+                "[dim]hjkl[/dim] navigate  "
+                "[dim]b[/dim] back",
+                id="help",
+            )
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self._refresh_table()
+
+        def _refresh_table(self) -> None:
+            table = self.query_one("#sources-table", DataTable)
+            table.clear()
+            _, full_config, _ = self._get_group_data()
+            sources = full_config.get("sources", [])
+            idx = 1
+            for src in sources:
+                for repo in src.get("repositories", []):
+                    table.add_row(str(idx), repo)
+                    idx += 1
+
+        def action_add_repo(self) -> None:
+            def on_input(value: str) -> None:
+                if not value:
+                    return
+                repo = value.strip()
+                parts = repo.split("/")
+                if len(parts) != 2 or not all(parts):
+                    self.notify("Invalid format. Use owner/repo",
+                                severity="error")
+                    return
+                group_entry, full_config, is_external = self._get_group_data()
+                sources = full_config.setdefault("sources", [])
+                if not sources:
+                    sources.append({"type": "github", "repositories": []})
+                repos_list = sources[0].setdefault("repositories", [])
+                if repo in repos_list:
+                    self.notify("Already present", severity="warning")
+                    return
+                repos_list.append(repo)
+                self.app._save_group_config(group_entry, full_config,
+                                            is_external)
+                self.notify(f"Added {repo}")
+                self._refresh_table()
+
+            self.app.push_screen(
+                InputModal("Add Repository", "Repository (owner/repo)",
+                           placeholder="owner/repo"),
+                on_input,
+            )
+
+        def action_delete_repo(self) -> None:
+            _, full_config, _ = self._get_group_data()
+            all_repos = []
+            for src in full_config.get("sources", []):
+                all_repos.extend(src.get("repositories", []))
+            if not all_repos:
+                self.notify("No repositories to delete", severity="warning")
+                return
+
+            table = self.query_one("#sources-table", DataTable)
+            row_index = table.cursor_row
+            if row_index < 0 or row_index >= len(all_repos):
+                return
+            repo_to_remove = all_repos[row_index]
+
+            def on_confirm(confirmed: bool) -> None:
+                if not confirmed:
+                    return
+                group_entry, full_config, is_external = self._get_group_data()
+                for src in full_config.get("sources", []):
+                    repos = src.get("repositories", [])
+                    if repo_to_remove in repos:
+                        repos.remove(repo_to_remove)
+                        break
+                self.app._save_group_config(group_entry, full_config,
+                                            is_external)
+                self.notify(f"Removed {repo_to_remove}")
+                self._refresh_table()
+
+            self.app.push_screen(
+                ConfirmModal(f"Remove '{repo_to_remove}'?"), on_confirm
+            )
+
+        def action_edit_filters(self) -> None:
+            self.app.push_screen(EditFiltersScreen(self.group_index))
+
+    class EditFiltersScreen(GroupScreenBase):
+        """Full screen for managing filters on a source."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+            Binding("e", "edit_filter", "Edit"),
+            Binding("x", "clear_all", "Clear all"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            group_name = self._get_group_name()
+            yield Header()
+            yield Static(
+                f"[bold bright_cyan]>> Filters: {group_name}[/bold bright_cyan]",
+                id="screen-title",
+            )
+            table = VimDataTable(id="filters-table", zebra_stripes=True)
+            table.add_columns("Filter", "Values")
+            yield table
+            yield Static(
+                "[dim]e[/dim] edit  "
+                "[dim]x[/dim] clear all  "
+                "[dim]hjkl[/dim] navigate  "
+                "[dim]b[/dim] back",
+                id="help",
+            )
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self._refresh_table()
+
+        def _refresh_table(self) -> None:
+            table = self.query_one("#filters-table", DataTable)
+            table.clear()
+            _, full_config, _ = self._get_group_data()
+            sources = full_config.get("sources", [])
+            filters = sources[0].get("filters", {}) if sources else {}
+            table.add_row("exclude_authors",
+                          ", ".join(filters.get("exclude_authors", [])) or "(none)")
+            table.add_row("exclude_titles",
+                          ", ".join(filters.get("exclude_titles", [])) or "(none)")
+            table.add_row("exclude_labels",
+                          ", ".join(filters.get("exclude_labels", [])) or "(none)")
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            self._edit_row(event.cursor_row)
+
+        def action_edit_filter(self) -> None:
+            table = self.query_one("#filters-table", DataTable)
+            self._edit_row(table.cursor_row)
+
+        def _edit_row(self, row_index: int) -> None:
+            filter_keys = ["exclude_authors", "exclude_titles", "exclude_labels"]
+            labels = {
+                "exclude_authors": "Exclude authors (comma-separated)",
+                "exclude_titles": "Exclude title patterns (comma-separated regex)",
+                "exclude_labels": "Exclude labels (comma-separated)",
+            }
+            if row_index < 0 or row_index >= len(filter_keys):
+                return
+            key = filter_keys[row_index]
+
+            _, full_config, _ = self._get_group_data()
+            sources = full_config.get("sources", [])
+            filters = sources[0].get("filters", {}) if sources else {}
+            current = ", ".join(filters.get(key, []))
+
+            def on_input(value: str) -> None:
+                if value == "" and not current:
+                    return  # Cancel on empty when nothing was set
+                group_entry, full_config, is_external = self._get_group_data()
+                sources = full_config.setdefault("sources", [])
+                if not sources:
+                    sources.append({"type": "github", "repositories": []})
+                source = sources[0]
+                filters = source.setdefault("filters", {})
+
+                parsed = [v.strip() for v in value.split(",") if v.strip()]
+
+                # Validate regex for exclude_titles
+                if key == "exclude_titles" and parsed:
+                    for p in parsed:
+                        try:
+                            re.compile(p)
+                        except re.error as e:
+                            self.notify(f"Invalid regex '{p}': {e}",
+                                        severity="error")
+                            return
+
+                if parsed:
+                    filters[key] = parsed
+                else:
+                    filters.pop(key, None)
+
+                if not any(filters.values()):
+                    source.pop("filters", None)
+
+                self.app._save_group_config(group_entry, full_config,
+                                            is_external)
+                self.notify(f"Updated {key}")
+                self._refresh_table()
+
+            self.app.push_screen(
+                InputModal(key, labels[key], default=current),
+                on_input,
+            )
+
+        def action_clear_all(self) -> None:
+            def on_confirm(confirmed: bool) -> None:
+                if not confirmed:
+                    return
+                group_entry, full_config, is_external = self._get_group_data()
+                sources = full_config.get("sources", [])
+                if sources:
+                    sources[0].pop("filters", None)
+                self.app._save_group_config(group_entry, full_config,
+                                            is_external)
+                self.notify("Filters cleared")
+                self._refresh_table()
+
+            self.app.push_screen(
+                ConfirmModal("Clear all filters?"), on_confirm
+            )
+
+    class EditTeamContextScreen(GroupScreenBase):
+        """Full screen for editing team context fields."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+            Binding("e", "edit_field", "Edit"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            group_name = self._get_group_name()
+            yield Header()
+            yield Static(
+                f"[bold bright_cyan]>> Team Context: {group_name}[/bold bright_cyan]",
+                id="screen-title",
+            )
+            table = VimDataTable(id="team-context-table", zebra_stripes=True)
+            table.add_columns("Field", "Value")
+            yield table
+            yield Static(
+                "[dim]e[/dim] edit  "
+                "[dim]hjkl[/dim] navigate  "
+                "[dim]b[/dim] back",
+                id="help",
+            )
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self._refresh_table()
+
+        def _refresh_table(self) -> None:
+            table = self.query_one("#team-context-table", DataTable)
+            table.clear()
+            _, full_config, _ = self._get_group_data()
+            tc = full_config.get("team_context", {})
+            table.add_row("name", tc.get("name", "") or "(not set)")
+            table.add_row("focus_areas",
+                          ", ".join(tc.get("focus_areas", [])) or "(none)")
+            table.add_row("priorities",
+                          ", ".join(tc.get("priorities", [])) or "(none)")
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            self._edit_row(event.cursor_row)
+
+        def action_edit_field(self) -> None:
+            table = self.query_one("#team-context-table", DataTable)
+            self._edit_row(table.cursor_row)
+
+        def _edit_row(self, row_index: int) -> None:
+            fields = ["name", "focus_areas", "priorities"]
+            labels = {
+                "name": "Team name",
+                "focus_areas": "Focus areas (comma-separated)",
+                "priorities": "Priorities (comma-separated, first = highest)",
+            }
+            if row_index < 0 or row_index >= len(fields):
+                return
+            field = fields[row_index]
+
+            _, full_config, _ = self._get_group_data()
+            tc = full_config.get("team_context", {})
+
+            if field == "name":
+                current = tc.get("name", "")
+            else:
+                current = ", ".join(tc.get(field, []))
+
+            def on_input(value: str) -> None:
+                if value == "" and not current:
+                    return
+                group_entry, full_config, is_external = self._get_group_data()
+                tc = full_config.setdefault("team_context", {})
+
+                if field == "name":
+                    tc["name"] = value.strip()
+                else:
+                    tc[field] = [v.strip() for v in value.split(",")
+                                 if v.strip()]
+
+                self.app._save_group_config(group_entry, full_config,
+                                            is_external)
+                self.notify(f"Updated {field}")
+                self._refresh_table()
+
+            self.app.push_screen(
+                InputModal(field, labels[field], default=current),
+                on_input,
+            )
+
+    class JsonViewScreen(GroupScreenBase):
+        """Read-only JSON view of a group config."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+            Binding("j", "scroll_down", "Down", show=False),
+            Binding("k", "scroll_up", "Up", show=False),
+        ]
+
+        def compose(self) -> ComposeResult:
+            group_name = self._get_group_name()
+            _, full_config, _ = self._get_group_data()
+            display = dict(full_config)
+            display.pop("name", None)
+            formatted = json.dumps(display, indent=2)
+
+            yield Header()
+            yield Static(
+                f"[bold bright_cyan]>> Config: {group_name}[/bold bright_cyan]",
+                id="screen-title",
+            )
+            with VerticalScroll(id="json-scroll"):
+                yield Static(
+                    Syntax(formatted, "json", theme="monokai",
+                           word_wrap=True),
+                    id="json-view",
+                )
+            yield Static("[dim]j/k[/dim] scroll  [dim]b[/dim] back", id="help")
+            yield Footer()
+
+        def action_scroll_down(self) -> None:
+            self.query_one("#json-scroll", VerticalScroll).scroll_down()
+
+        def action_scroll_up(self) -> None:
+            self.query_one("#json-scroll", VerticalScroll).scroll_up()
+
+    class SecretsScreen(Screen):
+        """Manage webhook secrets per group."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static("[bold bright_cyan]>> Secrets[/bold bright_cyan]", id="screen-title")
+            table = VimDataTable(id="secrets-table", zebra_stripes=True)
+            table.add_columns("Group", "Webhook URL", "Source")
+            yield table
+            yield Static(
+                "[dim]Enter[/dim] set/update  [dim]hjkl[/dim] navigate  [dim]b[/dim] back",
+                id="help",
+            )
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self._refresh_table()
+
+        def _refresh_table(self) -> None:
+            table = self.query_one("#secrets-table", DataTable)
+            table.clear()
+            groups = self.app.config.get("groups", [])
+            for g in groups:
+                name = g.get("name", "unnamed")
+                secrets = self.app._load_secrets(name)
+                webhook = secrets.get("teams_webhook_url", "")
+                if webhook:
+                    table.add_row(name, self.app._mask_secret(webhook),
+                                  f"secrets/{name}.json")
+                else:
+                    table.add_row(name, "(not set)", "-")
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            row_index = event.cursor_row
+            groups = self.app.config.get("groups", [])
+            if row_index < 0 or row_index >= len(groups):
+                return
+
+            group_name = groups[row_index].get("name", "unnamed")
+            secrets = self.app._load_secrets(group_name)
+            current = secrets.get("teams_webhook_url", "")
+
+            if current:
+                # Webhook exists — offer update or remove
+                def on_action(action: str) -> None:
+                    if not action:
+                        return
+                    if action == "update":
+                        def on_url(url: str) -> None:
+                            url = url.strip()
+                            if not url:
+                                return
+                            fresh = self.app._load_secrets(group_name)
+                            fresh["teams_webhook_url"] = url
+                            self.app._save_secrets(group_name, fresh)
+                            self.notify(f"Updated webhook for {group_name}")
+                            self._refresh_table()
+
+                        self.app.push_screen(
+                            InputModal("Webhook URL", "Enter URL",
+                                       default=current),
+                            on_url,
+                        )
+                    elif action == "remove":
+                        def on_remove_confirm(confirmed: bool) -> None:
+                            if not confirmed:
+                                return
+                            fresh = self.app._load_secrets(group_name)
+                            fresh.pop("teams_webhook_url", None)
+                            if fresh:
+                                self.app._save_secrets(group_name, fresh)
+                            else:
+                                secrets_path = (self.app.config_dir /
+                                                "secrets" /
+                                                f"{group_name}.json")
+                                if secrets_path.exists():
+                                    self.app._backup_file(secrets_path)
+                                    secrets_path.unlink()
+                            self.notify(f"Removed webhook for {group_name}")
+                            self._refresh_table()
+
+                        self.app.push_screen(
+                            ConfirmModal("Remove webhook URL?"),
+                            on_remove_confirm,
+                        )
+
+                self.app.push_screen(
+                    SelectModal("Webhook Action", [
+                        ("update", "Update URL"),
+                        ("remove", "Remove URL"),
+                    ]),
+                    on_action,
+                )
+            else:
+                # No webhook — offer to set one
+                def on_url(url: str) -> None:
+                    url = url.strip()
+                    if not url:
+                        return
+                    fresh = self.app._load_secrets(group_name)
+                    fresh["teams_webhook_url"] = url
+                    self.app._save_secrets(group_name, fresh)
+                    self.notify(f"Set webhook for {group_name}")
+                    self._refresh_table()
+
+                self.app.push_screen(
+                    InputModal("Set Webhook", "Webhook URL",
+                               placeholder="https://..."),
+                    on_url,
+                )
+
+        def action_go_back(self) -> None:
+            self.app.pop_screen()
+
+    class ValidateScreen(Screen):
+        """Run and display configuration validation."""
+
+        BINDINGS = [
+            Binding("b", "go_back", "Back"),
+            Binding("j", "scroll_down", "Down", show=False),
+            Binding("k", "scroll_up", "Up", show=False),
+            Binding("r", "rerun", "Re-run"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static("[bold bright_cyan]>> Validate[/bold bright_cyan]", id="screen-title")
+            with VerticalScroll(id="validate-scroll"):
+                yield Static("[dim]Running validation...[/dim]", id="validate-output")
+            yield Static(
+                "[dim]j/k[/dim] scroll  [dim]r[/dim] re-run  [dim]b[/dim] back", id="help"
+            )
+            yield Footer()
+
+        def action_scroll_down(self) -> None:
+            self.query_one("#validate-scroll", VerticalScroll).scroll_down()
+
+        def action_scroll_up(self) -> None:
+            self.query_one("#validate-scroll", VerticalScroll).scroll_up()
+
+        def on_mount(self) -> None:
+            self._run_validation()
+
+        def _run_validation(self) -> None:
+            output_widget = self.query_one("#validate-output", Static)
+            try:
+                config_path_str = (str(self.app.config_path)
+                                   if self.app.config_path else None)
+                output = _capture_validation_output(config_path_str)
+                lines = [_colorize_validation_line(line, use_markers=True)
+                         for line in output.strip().split('\n')]
+                output_widget.update("\n".join(lines))
+            except Exception as e:
+                output_widget.update(f"[red]Validation error: {e}[/red]")
+
+        def action_rerun(self) -> None:
+            self._run_validation()
+
+        def action_go_back(self) -> None:
+            self.app.pop_screen()
+
+    class ConfigApp(ConfigStore, App):
+        """Textual TUI for Herald configuration management."""
+
+        TITLE = "Herald Configuration"
+        SUB_TITLE = "Manage your Herald config interactively"
+
+        CSS = """
+        Screen {
+            background: $surface;
+        }
+
+        /* --- Banner / screen titles --- */
+        #banner {
+            margin: 1 3;
+            height: auto;
+            padding: 1 2;
+            background: $panel;
+            border: round $accent;
+        }
+        #screen-title {
+            margin: 1 3 0 3;
+            height: auto;
+            padding: 0 1;
+        }
+
+        /* --- List views (main menu, group detail) --- */
+        #main-menu, #group-menu {
+            margin: 1 3;
+            height: auto;
+            padding: 1 0;
+        }
+        #main-menu > ListItem, #group-menu > ListItem {
+            padding: 0 2;
+        }
+
+        /* --- Data tables --- */
+        #defaults-table, #groups-table, #secrets-table,
+        #sources-table, #filters-table, #team-context-table {
+            margin: 1 3;
+            height: auto;
+            max-height: 60%;
+            border: round $primary-background-lighten-2;
+            padding: 0 1;
+        }
+
+        /* --- JSON view --- */
+        VerticalScroll {
+            margin: 1 3;
+            height: 1fr;
+            border: round $primary-background-lighten-2;
+            padding: 1 2;
+        }
+        #json-view {
+            height: auto;
+        }
+
+        /* --- Group detail title --- */
+        #group-title {
+            margin: 1 3;
+            height: auto;
+            padding: 1 2;
+            background: $panel;
+            border: round $accent;
+        }
+
+        /* --- Validate output --- */
+        #validate-output {
+            height: auto;
+            padding: 0 1;
+        }
+
+        /* --- Help bar (bottom hint line) --- */
+        #help {
+            dock: bottom;
+            height: 1;
+            margin: 0 3;
+            padding: 0 1;
+            color: $text-muted;
+            border-top: dashed $primary-background-lighten-2;
+        }
+        """
+
+        BINDINGS = [
+            Binding("ctrl+c", "quit", "Quit", show=False),
+            Binding("q", "quit", "Quit"),
+        ]
+
+        def __init__(self, config_path: Optional[str] = None, **kwargs):
+            super().__init__(**kwargs)
+            self._init_config(config_path)
+
+        def on_mount(self) -> None:
+            self.push_screen(MainMenuScreen())
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -1607,6 +3598,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="Herald - Multi-Source Repository Activity Tracker"
     )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # 'config' subcommand
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Interactive configuration manager (requires textual or rich)"
+    )
+    config_parser.add_argument(
+        '--config',
+        help='Path to configuration file'
+    )
+
+    # All existing flags on the top-level parser (unchanged)
     parser.add_argument(
         '--config',
         help='Path to configuration file'
@@ -1677,6 +3682,26 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Handle 'config' subcommand
+    if args.command == "config":
+        config_path = args.config or os.environ.get("HERALD_CONFIG")
+        if HAS_TEXTUAL:
+            app = ConfigApp(config_path=config_path)
+            app.run()
+        elif HAS_RICH:
+            print("Tip: Install textual for enhanced TUI: pip install textual")
+            manager = ConfigManager(config_path=config_path)
+            try:
+                manager.run()
+            except KeyboardInterrupt:
+                print("\nExiting.")
+        else:
+            print("Error: 'textual' module not found. Install with: pip install textual")
+            sys.exit(1)
+        return
+
+    # -- Existing run logic (command is None) --
 
     # Configure logging before anything else
     setup_logging(verbose=args.verbose, quiet=args.quiet)

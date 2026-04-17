@@ -24,13 +24,14 @@ python herald.py --teams            # Post to Microsoft Teams
 python herald.py --config path.json # Custom config file
 python herald.py --group occ-team   # Run specific group only
 python herald.py --list-groups      # Show configured groups
+python herald.py config             # Launch interactive TUI config editor
 ```
 
 There is no test suite, linter, or build system.
 
 ## Architecture
 
-The entire application is `herald.py`, structured into three classes plus a CLI entry point.
+The entire application is `herald.py`, structured into core classes, a TUI, and a CLI entry point.
 
 ### Class hierarchy
 
@@ -41,6 +42,8 @@ The entire application is `herald.py`, structured into three classes plus a CLI 
 - **`ClaudeCLIBackend(AIBackend)`** — default backend using Claude CLI subprocess. Configurable `timeout`. Saves debug prompts on failure.
 - **`AI_BACKEND_REGISTRY`** — dict mapping backend type strings (`"claude-cli"`) to backend classes. Extend by adding entries here.
 - **`Herald`** — main orchestrator. Handles config loading, group resolution, AI backend invocation, report saving, and Teams posting.
+- **`ConfigManager`** — Rich-based CLI config editor (fallback when Textual is not installed). Uses `Prompt`, `IntPrompt`, `Confirm` from Rich.
+- **`ConfigApp(App)`** — Textual TUI config editor (see TUI section below). Guarded by `if HAS_TEXTUAL:`.
 - **`main()`** — CLI argument parsing and orchestration.
 
 ### Data flow
@@ -72,6 +75,36 @@ The entire application is `herald.py`, structured into three classes plus a CLI 
 - 403 rate limit → falls back to stale cache, shows reset time
 - AI backend failure → saves debug prompt to `.cache/`, falls back to formatted raw data
 - Cache uses per-repo, per-activity-type, per-day files with 1-hour TTL; `--force` bypasses
+
+### TUI (`python herald.py config`)
+
+The `config` subcommand launches a Textual TUI for interactive configuration management. Falls back to a Rich-based CLI (`ConfigManager`) when Textual is not installed. All TUI code lives inside an `if HAS_TEXTUAL:` guard.
+
+#### TUI class hierarchy
+
+- **`VimDataTable(DataTable)`** / **`VimListView(ListView)`** — widgets with hjkl vim bindings mapped to arrow keys. Used throughout all screens.
+- **`ConfirmModal(ModalScreen[bool])`** — yes/no confirmation dialog. Accepts `yes_label` and `yes_variant` to customize the confirm button (defaults to destructive "Yes, delete" styling).
+- **`InputModal(ModalScreen[str])`** — generic single-field text input modal. Returns the input string on submit, empty string on cancel. Enter key submits.
+- **`SelectModal(ModalScreen[str])`** — generic option picker using VimListView. Returns the selected value string, empty string on cancel (`b` or `Escape`).
+- **`MainMenuScreen`** — top-level navigation: Defaults, Groups, Secrets, Validate, Exit.
+- **`DefaultsScreen`** — view/edit defaults via `InputModal` (integers, activity types) and `SelectModal` (AI backend type).
+- **`GroupsScreen`** — list groups, create (`c`) via `InputModal` + `SelectModal`, delete (`d`) via chained `ConfirmModal`s.
+- **`GroupDetailScreen`** — per-group menu: pushes to `EditSourcesScreen`, `EditTeamContextScreen`, or `JsonViewScreen`.
+- **`EditSourcesScreen`** — manage repos (`a` add, `d` delete, `f` filters) with `InputModal`/`ConfirmModal`.
+- **`EditFiltersScreen`** — edit exclude_authors/titles/labels via `InputModal`. Validates regex for exclude_titles. `x` clears all.
+- **`EditTeamContextScreen`** — edit team name, focus_areas, priorities via `InputModal`.
+- **`JsonViewScreen`** — read-only syntax-highlighted JSON view of group config.
+- **`SecretsScreen`** — manage webhook URLs via `SelectModal` (update/remove) and `InputModal`.
+- **`ValidateScreen`** — runs `Herald.validate()` and displays colorized results.
+- **`ConfigApp(App)`** — main app class with file I/O helpers, CSS, and config state.
+
+#### TUI patterns
+
+- **No `app.suspend()`** — all user input happens through native Textual modals (`InputModal`, `SelectModal`, `ConfirmModal`). The TUI never drops to the raw terminal.
+- **Callback chaining** — modals are async; results arrive via callbacks passed to `push_screen(modal, callback)`. Multi-step flows chain callbacks (e.g., create group: `InputModal` → `SelectModal`; delete group: `ConfirmModal` → `ConfirmModal`).
+- **Re-fetch before mutation** — callbacks that modify data re-fetch the current state (e.g., `self.app._load_secrets(group_name)`) rather than closing over stale references captured before the modal was shown.
+- **Save + notify + refresh** — after every mutation, screens call the appropriate save method (`_save_main_config`, `_save_group_config`, `_save_secrets`), show a notification, and refresh their table.
+- **`_get_group_data()` helper** — `EditSourcesScreen`, `EditFiltersScreen`, and `EditTeamContextScreen` each have this method returning `(group_entry, full_config, is_external)` for consistent config access.
 
 ## Configuration
 
@@ -118,4 +151,5 @@ Groups can also be defined inline in `herald.config.json` (see `herald.config.ex
 ## Dependencies
 
 - **Python**: `requests`, `python-dateutil` (see `requirements.txt`)
+- **Python (optional)**: `textual` for TUI config editor, `rich` for CLI config editor fallback
 - **System**: Claude CLI (default AI backend; must be installed and authenticated)
