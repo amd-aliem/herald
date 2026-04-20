@@ -46,7 +46,7 @@ except ImportError:
 try:
     from textual.app import App, ComposeResult
     from textual.screen import Screen, ModalScreen
-    from textual.widgets import Header, Footer, Static, DataTable, ListView, ListItem, Label, Input
+    from textual.widgets import Header, Footer, Static, DataTable, ListView, ListItem, Label, Input, TextArea
     from textual.containers import Container, VerticalScroll
     from textual.binding import Binding
     HAS_TEXTUAL = True
@@ -2480,6 +2480,69 @@ if HAS_TEXTUAL:
         def on_input_submitted(self, event: Input.Submitted) -> None:
             self.dismiss(event.value)
 
+    class TextAreaModal(ModalScreen[str]):
+        """Multi-line text editor modal.  One item per line.
+
+        Returns the full text on submit, empty string on cancel.
+        """
+
+        ESCAPE_TO_MINIMIZE = False
+
+        BINDINGS = [
+            Binding("ctrl+s", "submit", "Save", priority=True, show=False),
+            Binding("ctrl+c", "cancel", "Cancel", priority=True, show=False),
+        ]
+
+        DEFAULT_CSS = """
+        TextAreaModal {
+            align: center middle;
+        }
+        TextAreaModal > Container {
+            width: 80;
+            height: auto;
+            max-height: 30;
+            border: heavy $accent;
+            background: $surface;
+            padding: 1 2;
+            border-title-color: $accent;
+            border-title-style: bold;
+        }
+        TextAreaModal TextArea {
+            height: 12;
+            margin: 1 0;
+        }
+        TextAreaModal > Container > #ta-hint {
+            width: 100%;
+            content-align: center middle;
+            color: $text-muted;
+        }
+        """
+
+        def __init__(self, title: str, label: str, default: str = "") -> None:
+            super().__init__()
+            self._title = title
+            self._label = label
+            self._default = default
+
+        def compose(self) -> ComposeResult:
+            with Container(id="ta-dialog"):
+                yield Label(self._label, id="ta-label")
+                yield TextArea(self._default, id="ta-field")
+                yield Label("Ctrl-S = save  /  Esc or Ctrl-C = cancel", id="ta-hint")
+
+        def on_mount(self) -> None:
+            self.query_one("#ta-dialog", Container).border_title = self._title
+            self.query_one("#ta-field", TextArea).focus()
+
+        def _key_escape(self) -> None:
+            self.dismiss("")
+
+        def action_cancel(self) -> None:
+            self.dismiss("")
+
+        def action_submit(self) -> None:
+            self.dismiss(self.query_one("#ta-field", TextArea).text)
+
     class SelectModal(ModalScreen[str]):
         """Generic option picker modal."""
 
@@ -3174,9 +3237,9 @@ if HAS_TEXTUAL:
         def _edit_row(self, row_index: int) -> None:
             filter_keys = ["exclude_authors", "exclude_titles", "exclude_labels"]
             labels = {
-                "exclude_authors": "Exclude authors (comma-separated)",
-                "exclude_titles": "Exclude title patterns (comma-separated regex)",
-                "exclude_labels": "Exclude labels (comma-separated)",
+                "exclude_authors": "Exclude authors (one per line)",
+                "exclude_titles": "Exclude title patterns (one regex per line)",
+                "exclude_labels": "Exclude labels (one per line)",
             }
             if row_index < 0 or row_index >= len(filter_keys):
                 return
@@ -3185,19 +3248,13 @@ if HAS_TEXTUAL:
             _, full_config, _ = self._get_group_data()
             sources = full_config.get("sources", [])
             filters = sources[0].get("filters", {}) if sources else {}
-            current = ", ".join(filters.get(key, []))
+            items = filters.get(key, [])
+            current_text = "\n".join(items)
 
-            def on_input(value: str) -> None:
-                if value == "" and not current:
-                    return  # Cancel on empty when nothing was set
-                group_entry, full_config, is_external = self._get_group_data()
-                sources = full_config.setdefault("sources", [])
-                if not sources:
-                    sources.append({"type": "github", "repositories": []})
-                source = sources[0]
-                filters = source.setdefault("filters", {})
-
-                parsed = [v.strip() for v in value.split(",") if v.strip()]
+            def on_text_input(value: str) -> None:
+                if value == "" and not items:
+                    return
+                parsed = [v.strip() for v in value.splitlines() if v.strip()]
 
                 # Validate regex for exclude_titles
                 if key == "exclude_titles" and parsed:
@@ -3209,22 +3266,39 @@ if HAS_TEXTUAL:
                                         severity="error")
                             return
 
-                if parsed:
-                    filters[key] = parsed
-                else:
-                    filters.pop(key, None)
+                preview = ", ".join(parsed) if parsed else "(clear)"
+                if len(preview) > 60:
+                    preview = preview[:57] + "..."
+                msg = f"Set {key} to: {preview}"
 
-                if not any(filters.values()):
-                    source.pop("filters", None)
+                def on_confirm(confirmed: bool) -> None:
+                    if not confirmed:
+                        return
+                    group_entry, full_config, is_external = self._get_group_data()
+                    sources = full_config.setdefault("sources", [])
+                    if not sources:
+                        sources.append({"type": "github", "repositories": []})
+                    source = sources[0]
+                    filt = source.setdefault("filters", {})
 
-                self.app._save_group_config(group_entry, full_config,
-                                            is_external)
-                self.notify(f"Updated {key}")
-                self._refresh_table()
+                    if parsed:
+                        filt[key] = parsed
+                    else:
+                        filt.pop(key, None)
+
+                    if not any(filt.values()):
+                        source.pop("filters", None)
+
+                    self.app._save_group_config(group_entry, full_config,
+                                                is_external)
+                    self.notify(f"Updated {key}")
+                    self._refresh_table()
+
+                self.app.push_screen(ConfirmModal(msg), on_confirm)
 
             self.app.push_screen(
-                InputModal(key, labels[key], default=current),
-                on_input,
+                TextAreaModal(key, labels[key], default=current_text),
+                on_text_input,
             )
 
         def action_clear_all(self) -> None:
@@ -3293,11 +3367,6 @@ if HAS_TEXTUAL:
 
         def _edit_row(self, row_index: int) -> None:
             fields = ["name", "focus_areas", "priorities"]
-            labels = {
-                "name": "Team name",
-                "focus_areas": "Focus areas (comma-separated)",
-                "priorities": "Priorities (comma-separated, first = highest)",
-            }
             if row_index < 0 or row_index >= len(fields):
                 return
             field = fields[row_index]
@@ -3307,30 +3376,60 @@ if HAS_TEXTUAL:
 
             if field == "name":
                 current = tc.get("name", "")
-            else:
-                current = ", ".join(tc.get(field, []))
 
-            def on_input(value: str) -> None:
-                if value == "" and not current:
+                def on_name_input(value: str) -> None:
+                    if value == "" and not current:
+                        return
+                    self._confirm_and_save(field, value)
+
+                self.app.push_screen(
+                    InputModal(field, "Team name", default=current),
+                    on_name_input,
+                )
+            else:
+                items = tc.get(field, [])
+                current_text = "\n".join(items)
+                label = ("Focus areas (one per line)"
+                         if field == "focus_areas"
+                         else "Priorities (one per line, first = highest)")
+
+                def on_text_input(value: str, _f=field) -> None:
+                    if value == "" and not items:
+                        return
+                    self._confirm_and_save(_f, value)
+
+                self.app.push_screen(
+                    TextAreaModal(field, label, default=current_text),
+                    on_text_input,
+                )
+
+        def _confirm_and_save(self, field: str, value: str) -> None:
+            """Show a confirmation dialog, then persist the change."""
+            if field == "name":
+                preview = value.strip() or "(empty)"
+            else:
+                parsed = [v.strip() for v in value.splitlines() if v.strip()]
+                preview = ", ".join(parsed) if parsed else "(clear)"
+                if len(preview) > 60:
+                    preview = preview[:57] + "..."
+            msg = f"Set {field} to: {preview}"
+
+            def on_confirm(confirmed: bool) -> None:
+                if not confirmed:
                     return
                 group_entry, full_config, is_external = self._get_group_data()
                 tc = full_config.setdefault("team_context", {})
-
                 if field == "name":
                     tc["name"] = value.strip()
                 else:
-                    tc[field] = [v.strip() for v in value.split(",")
+                    tc[field] = [v.strip() for v in value.splitlines()
                                  if v.strip()]
-
                 self.app._save_group_config(group_entry, full_config,
                                             is_external)
                 self.notify(f"Updated {field}")
                 self._refresh_table()
 
-            self.app.push_screen(
-                InputModal(field, labels[field], default=current),
-                on_input,
-            )
+            self.app.push_screen(ConfirmModal(msg), on_confirm)
 
     class JsonViewScreen(GroupScreenBase):
         """Read-only JSON view of a group config."""
