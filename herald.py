@@ -1847,6 +1847,98 @@ Start directly with "### Summary"."""
 
 
 # ---------------------------------------------------------------------------
+# Teams helpers (used by `herald post`)
+# ---------------------------------------------------------------------------
+
+def markdown_to_adaptive_card_blocks(markdown_text: str) -> List[Dict]:
+    """Convert markdown text into Adaptive Card body blocks."""
+    blocks = []
+    for line in markdown_text.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith('# '):
+            blocks.append({
+                "type": "TextBlock",
+                "text": stripped[2:],
+                "size": "ExtraLarge",
+                "weight": "Bolder",
+                "wrap": True,
+            })
+        elif stripped.startswith('## '):
+            blocks.append({
+                "type": "TextBlock",
+                "text": stripped[3:],
+                "size": "Large",
+                "weight": "Bolder",
+                "wrap": True,
+                "separator": True,
+            })
+        elif stripped.startswith('### '):
+            blocks.append({
+                "type": "TextBlock",
+                "text": stripped[4:],
+                "size": "Medium",
+                "weight": "Bolder",
+                "wrap": True,
+                "separator": True,
+            })
+        elif stripped.startswith('---'):
+            blocks.append({"type": "TextBlock", "text": " ", "separator": True})
+        elif stripped.startswith(('- ', '* ')):
+            blocks.append({
+                "type": "TextBlock",
+                "text": "• " + stripped[2:],
+                "wrap": True,
+            })
+        else:
+            blocks.append({"type": "TextBlock", "text": stripped, "wrap": True})
+
+    return blocks
+
+
+def post_digest_to_teams(digest_output: str, webhook_url: str) -> bool:
+    """Post digest markdown to Microsoft Teams via Power Automate webhook."""
+    if not webhook_url:
+        logger.error("No webhook URL provided.")
+        return False
+
+    logger.info("Posting to Teams ...")
+    card_body = markdown_to_adaptive_card_blocks(digest_output)
+    payload = {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": None,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": card_body,
+            },
+        }],
+    }
+
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        if response.status_code in (200, 202):
+            logger.info("Posted to Teams successfully")
+            return True
+        logger.error("Error posting to Teams: HTTP %d", response.status_code)
+        logger.error("Response: %s", response.text[:500])
+        return False
+    except requests.exceptions.RequestException as e:
+        logger.error("Error posting to Teams: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Config migration
 # ---------------------------------------------------------------------------
 
@@ -2008,6 +2100,13 @@ def main():
     validate_parser = subparsers.add_parser("validate", help="Validate configuration")
     _add_common_args(validate_parser)
 
+    post_parser = subparsers.add_parser(
+        "post", help="Post digest markdown to Microsoft Teams (reads stdin)"
+    )
+    _add_common_args(post_parser)
+    post_parser.add_argument('--team', '-t', help='Team name (loads webhook from secrets)')
+    post_parser.add_argument('--webhook-url', help='Power Automate webhook URL')
+
     # Legacy top-level flags (deprecated digest path)
     parser.add_argument('--config', help=argparse.SUPPRESS)
     parser.add_argument('--repos', help=argparse.SUPPRESS)
@@ -2047,6 +2146,25 @@ def main():
 
     if args.command == "validate":
         sys.exit(0 if herald.validate() else 1)
+
+    if args.command == "post":
+        digest = sys.stdin.read()
+        if not digest.strip():
+            logger.error("No digest content on stdin")
+            sys.exit(1)
+        webhook = args.webhook_url or os.environ.get("HERALD_TEAMS_WEBHOOK")
+        if not webhook and args.team:
+            secrets_path = herald.config_dir / "secrets" / f"{args.team}.json"
+            if secrets_path.exists():
+                try:
+                    with open(secrets_path) as f:
+                        webhook = json.load(f).get("teams_webhook_url")
+                except Exception as e:
+                    logger.error("Failed to read secrets from %s: %s", secrets_path, e)
+        if not webhook:
+            logger.error("No webhook URL. Use --webhook-url, --team, or HERALD_TEAMS_WEBHOOK")
+            sys.exit(1)
+        sys.exit(0 if post_digest_to_teams(digest, webhook) else 1)
 
     # Legacy hidden flags
     if args.list_teams or args.list_groups:
