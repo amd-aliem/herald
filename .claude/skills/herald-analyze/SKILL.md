@@ -33,8 +33,13 @@ A JSON file with `{ "meta": { team, team_context, time_window_days, since, ... }
 **TL;DR:** <2-3 sentences leading with items matching priorities[0], then key themes>
 
 ### owner/repo
-- [HIGH PRIORITY] **Title** [STATUS] ([#N](url)) by @author — What changed and why it matters
-- **Title** [STATUS] ([#N](url)) by @author — What changed and why it matters
+- [HIGH PRIORITY] **Title** [STATUS] ([#N](url)) PR by @author — What changed and why it matters
+- **Title** [STATUS] ([#N](url)) PR by @author — What changed and why it matters
+- **Title** [STATUS] ([#N](url)) Issue — What the issue reports
+- **Title** [STATUS] ([#N](url), +N more) Summary — Grouped description
+- **Title** [RELEASED] ([vX.Y.Z](url)) Release
+- **Title** Commit (abc1234) — What the commit does
+- N other commits including X, Y, and Z.
 
 ### owner/repo
 ...
@@ -48,9 +53,16 @@ A JSON file with `{ "meta": { team, team_context, time_window_days, since, ... }
 
 ## Format rules
 
-- STATUS values: MERGED, OPEN, CLOSED, RELEASED
+- `[STATUS]` values (square brackets required): `[MERGED]`, `[OPEN]`, `[CLOSED]`, `[RELEASED]`
+- **Item type** label is required after the link/status: `PR`, `Issue`, `Summary`, `Release`, `Commit`, or `Commits`
+  - PRs: `[STATUS] ([#N](url)) PR by @author`
+  - Issues: `[STATUS] ([#N](url)) Issue`
+  - Grouped items: `[STATUS] ([#N](url), +N more) Summary`
+  - Releases: `[RELEASED] ([tag](url)) Release`
+  - Commits: `Commit (sha)` or `Commits (sha, sha)`
+- `by @author` is required for PRs; omit for issues, summaries, releases, and commits
 - Start directly with `**TL;DR:**` — no preamble, heading, or sign-off
 - `###` headings for each active repo and Recommended Actions
 - Items matching `team_context.priorities[0]` go first in their repo section, tagged `[HIGH PRIORITY]`
-- Em dash (` — `) separating attribution from context sentence is required
+- Em dash (` — `) separating type/attribution from context sentence is required
 - 1-3 recommended actions; fewer is fine. Actions should be specific ("review PR #X for security implications") not generic

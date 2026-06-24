@@ -1225,50 +1225,262 @@ class Herald:
 # Teams helpers (used by `herald post`)
 # ---------------------------------------------------------------------------
 
+def _prettify_tags(text: str) -> str:
+    """Replace status/priority tags with styled indicators for cards."""
+    text = text.replace('[HIGH PRIORITY] ', '\U0001f53a ')
+    text = text.replace('[MERGED]', '\u2705 Merged')
+    text = text.replace('[OPEN]', '\U0001f7e1 Open')
+    text = text.replace('[CLOSED]', '\u26aa Closed')
+    text = text.replace('[RELEASED]', '\U0001f680 Released')
+    return text
+
+
 def markdown_to_adaptive_card_blocks(markdown_text: str) -> List[Dict]:
-    """Convert markdown text into Adaptive Card body blocks."""
-    blocks = []
+    """Convert markdown text into Adaptive Card body blocks.
+
+    Parses the digest markdown into structured sections and builds
+    an Adaptive Card with:
+    - Accent-styled H1 title container
+    - TL;DR paragraph always visible
+    - Per-repo ### sections: condensed bullet list (title+link) always
+      visible, context sentences behind a toggle
+    - Recommended Actions: same condensed/detail split
+    - Zero-activity repos (from ## raw sections) collapsed into footer
+    """
+
+    # -- Phase 1: Parse into title, H3 sections, and H2 (repo) sections --
+    title_text = None
+    subtitle_text = None
+    preamble: List[str] = []       # lines before first ### or ##
+    h3_sections: List[tuple] = []  # (heading, body_lines)
+    h2_sections: List[tuple] = []  # (heading, body_lines)
+
+    current_heading = None
+    current_level = 0
+    current_body: List[str] = []
+
+    def _save_current():
+        nonlocal current_heading, current_body, current_level
+        if current_heading is not None:
+            if current_level == 3:
+                h3_sections.append((current_heading, current_body))
+            elif current_level == 2:
+                h2_sections.append((current_heading, current_body))
+        elif current_body:
+            preamble.extend(current_body)
+        current_heading = None
+        current_body = []
+        current_level = 0
+
     for line in markdown_text.split('\n'):
         stripped = line.strip()
         if not stripped:
             continue
-
-        if stripped.startswith('# '):
-            blocks.append({
-                "type": "TextBlock",
-                "text": stripped[2:],
-                "size": "ExtraLarge",
-                "weight": "Bolder",
-                "wrap": True,
-            })
-        elif stripped.startswith('## '):
-            blocks.append({
-                "type": "TextBlock",
-                "text": stripped[3:],
-                "size": "Large",
-                "weight": "Bolder",
-                "wrap": True,
-                "separator": True,
-            })
+        if stripped.startswith('# ') and not stripped.startswith('## '):
+            title_text = stripped[2:]
+        elif stripped.startswith('## ') and not stripped.startswith('### '):
+            _save_current()
+            current_heading = stripped[3:]
+            current_level = 2
         elif stripped.startswith('### '):
-            blocks.append({
-                "type": "TextBlock",
-                "text": stripped[4:],
-                "size": "Medium",
-                "weight": "Bolder",
-                "wrap": True,
-                "separator": True,
-            })
+            _save_current()
+            current_heading = stripped[4:]
+            current_level = 3
         elif stripped.startswith('---'):
-            blocks.append({"type": "TextBlock", "text": " ", "separator": True})
-        elif stripped.startswith(('- ', '* ')):
+            continue  # skip raw separators
+        else:
+            if stripped.startswith('*Team:') or stripped.startswith('_Team:'):
+                subtitle_text = stripped
+            elif current_heading is not None:
+                current_body.append(stripped)
+            else:
+                preamble.append(stripped)
+    _save_current()
+
+    # -- Phase 2: Build Adaptive Card blocks --
+    blocks: List[Dict] = []
+
+    # Title container
+    if title_text:
+        title_items = [{
+            "type": "TextBlock",
+            "text": title_text,
+            "size": "ExtraLarge",
+            "weight": "Bolder",
+            "wrap": True
+        }]
+        if subtitle_text:
+            title_items.append({
+                "type": "TextBlock",
+                "text": subtitle_text,
+                "size": "Small",
+                "isSubtle": True,
+                "wrap": True,
+                "spacing": "None"
+            })
+        blocks.append({
+            "type": "Container",
+            "style": "accent",
+            "bleed": True,
+            "items": title_items
+        })
+
+    # Preamble (TL;DR paragraph)
+    if preamble:
+        blocks.append({
+            "type": "TextBlock",
+            "text": "\n\n".join(preamble),
+            "wrap": True
+        })
+
+    # H3 sections — split bullets at " — " into condensed + detail
+    for idx, (heading, body) in enumerate(h3_sections):
+        section_id = f"section-{idx}"
+        expand_id = f"expand-{idx}"
+        collapse_id = f"collapse-{idx}"
+
+        condensed: List[str] = []
+        details: List[str] = []
+        has_details = False
+
+        for bline in body:
+            if (bline.startswith('- ') or bline.startswith('* ')) \
+                    and ' \u2014 ' in bline:
+                short, context = bline.split(' \u2014 ', 1)
+                # Extract links from short part, fall back to context
+                links = re.findall(
+                    r'\[#?\d+[^]]*\]\([^)]+\)', short)
+                if not links:
+                    links = re.findall(
+                        r'\[#?\d+[^]]*\]\([^)]+\)', context)
+                link_str = (" (" + ", ".join(links) + ")"
+                            if links else "")
+                # Split attribution ("by @...") from the title line
+                attr_match = re.search(r'\s+(by @.+)$', short)
+                if attr_match:
+                    title_line = short[:attr_match.start()]
+                    attribution = attr_match.group(1)
+                    condensed.append(
+                        f"{title_line}\n\u2514\u2500 _{attribution}_")
+                else:
+                    # Append extracted links to condensed if not
+                    # already present in the short part
+                    if link_str and '[#' not in short:
+                        condensed.append(f"{short} {link_str}")
+                    else:
+                        condensed.append(short)
+                # Build detail line with title and links
+                title_match = re.search(r'\*\*(.+?)\*\*', short)
+                if title_match:
+                    details.append(
+                        f"- **{title_match.group(1)}**"
+                        f"{link_str}: {context}")
+                else:
+                    details.append(f"- {context}")
+                has_details = True
+            else:
+                condensed.append(bline)
+                details.append(bline)
+
+        # Heading — hyperlink repo name to GitHub
+        display_heading = heading
+        if '/' in heading and heading[0].isalpha():
+            repo_url = f"https://github.com/{heading}"
+            display_heading = f"[{heading}]({repo_url})"
+
+        blocks.append({
+            "type": "TextBlock",
+            "text": display_heading,
+            "size": "Medium",
+            "weight": "Bolder",
+            "wrap": True,
+            "separator": True
+        })
+
+        max_condensed = 5
+        if condensed:
+            shown = condensed[:max_condensed]
+            overflow = len(condensed) - max_condensed
             blocks.append({
                 "type": "TextBlock",
-                "text": "• " + stripped[2:],
-                "wrap": True,
+                "text": _prettify_tags(
+                    "\n\n".join(shown)),
+                "wrap": True
             })
-        else:
-            blocks.append({"type": "TextBlock", "text": stripped, "wrap": True})
+            if overflow > 0:
+                has_details = True  # ensure toggle shows
+                blocks.append({
+                    "type": "TextBlock",
+                    "text": f"_+{overflow} more below..._",
+                    "wrap": True,
+                    "isSubtle": True,
+                    "size": "Small",
+                    "spacing": "Small"
+                })
+
+        if has_details:
+            blocks.append({
+                "type": "ActionSet",
+                "id": expand_id,
+                "actions": [{
+                    "type": "Action.ToggleVisibility",
+                    "title": "\u25b6 More context",
+                    "targetElements": [
+                        section_id, collapse_id, expand_id]
+                }]
+            })
+            blocks.append({
+                "type": "ActionSet",
+                "id": collapse_id,
+                "isVisible": False,
+                "actions": [{
+                    "type": "Action.ToggleVisibility",
+                    "title": "\u25bc Less",
+                    "targetElements": [
+                        section_id, collapse_id, expand_id]
+                }]
+            })
+            blocks.append({
+                "type": "Container",
+                "id": section_id,
+                "isVisible": False,
+                "items": [{
+                    "type": "TextBlock",
+                    "text": _prettify_tags(
+                        "\n\n".join(details)),
+                    "wrap": True
+                }]
+            })
+
+    # H2 sections (raw activity counts) — only used for low-activity footer
+    low_activity_repos: List[str] = []
+
+    for heading, body in h2_sections:
+        raw_line = next(
+            (l for l in body
+             if 'Raw activity:' in l or 'raw activity:' in l.lower()),
+            None
+        )
+        if raw_line:
+            counts = re.findall(
+                r'(\d+)\s+(?:commits|PRs|issues|releases)', raw_line)
+            total = sum(int(c) for c in counts) if counts else 0
+            if total == 0:
+                short = heading.split('/')[-1] if '/' in heading \
+                    else heading
+                low_activity_repos.append(short)
+
+    if low_activity_repos:
+        names = ", ".join(low_activity_repos)
+        blocks.append({
+            "type": "TextBlock",
+            "text": f"_No activity: {names}_",
+            "wrap": True,
+            "separator": True,
+            "isSubtle": True,
+            "size": "Small",
+            "spacing": "Large"
+        })
 
     return blocks
 
@@ -1289,7 +1501,8 @@ def post_digest_to_teams(digest_output: str, webhook_url: str) -> bool:
             "content": {
                 "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                 "type": "AdaptiveCard",
-                "version": "1.4",
+                "version": "1.5",
+                "msteams": {"width": "Full"},
                 "body": card_body,
             },
         }],
