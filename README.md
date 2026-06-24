@@ -1,91 +1,102 @@
-# Herald - Multi-Source Repository Activity Tracker
+# Herald
 
-Herald fetches recent activity from GitHub repositories and generates AI-powered summaries using Claude CLI. Configure groups of repositories with team-specific context so the AI highlights what matters most to your team.
+Herald fetches GitHub repository activity and produces team-focused digests. The data pipeline lives in Python; AI analysis lives in Claude Code skills.
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.8+
-- [Claude CLI](https://github.com/anthropics/claude-code) installed and authenticated
-- (Optional) `GITHUB_TOKEN` environment variable for higher API rate limits
-
-### Install
-
 ```bash
+# 1. Install
 pip install -r requirements.txt
+export GITHUB_TOKEN=ghp_...  # optional but recommended (5000 vs 60 req/hour)
+
+# 2. Configure (interactive)
+/herald-config               # inside Claude Code
+
+# 3. Generate a digest
+/herald-digest my-team
 ```
 
-### Configure
-
-Copy the example config and create your group config:
+Or manually:
 
 ```bash
-cp herald.config.example.json herald.config.json
-cp groups/example.json groups/my-team.json
-# Edit groups/my-team.json with your repositories, team context, and webhook URL
+python herald.py fetch --team my-team -o activity.json
+# then use /herald-analyze with the JSON, or pipe through your own tooling
 ```
 
-### Run
+## CLI Reference
+
+Herald uses subcommands. Run `python herald.py <command> --help` for full details.
+
+### fetch
+
+Fetch activity from configured sources and write structured JSON.
 
 ```bash
-python herald.py
+# Fetch one team to stdout
+python herald.py fetch --team my-team
+
+# Fetch with options
+python herald.py fetch --team my-team --days 7 --force -o .cache/activity.json
+
+# Fetch ad-hoc repos (ignores team config)
+python herald.py fetch --repos owner/repo1,owner/repo2
+
+# Fetch multiple teams (writes to .cache/activity-<team>.json each)
+python herald.py fetch -t team-a -t team-b
 ```
 
-## Usage
+### list-teams
 
 ```bash
-# Use default config (herald.config.json)
-python herald.py
-
-# Override time window
-python herald.py --days 30
-
-# Override repositories (ignores configured groups)
-python herald.py --repos owner/repo1,owner/repo2
-
-# Save output to file
-python herald.py --output digest.md
-
-# Force regenerate, ignoring cache
-python herald.py --force
-
-# Post to Microsoft Teams
-python herald.py --teams
-
-# Run specific group(s) only
-python herald.py --group my-team
-python herald.py -g team-a -g team-b
-
-# List configured groups
-python herald.py --list-groups
-
-# Use a custom config file
-python herald.py --config /path/to/config.json
+python herald.py list-teams
 ```
+
+### validate
+
+Run pre-flight checks on config, secrets, and environment.
+
+```bash
+python herald.py validate
+```
+
+### post
+
+Post a digest to Microsoft Teams via Power Automate webhook. Reads markdown from stdin.
+
+```bash
+python herald.py post --team my-team < reports/my-team/herald-digest-2026-06-24.md
+python herald.py post --webhook-url "$URL" < digest.md
+```
+
+## Skills (Claude Code)
+
+Skills live in `.claude/skills/` and are available automatically when working in this repo.
+
+| Skill | Invocation | Purpose |
+|-------|------------|---------|
+| herald-digest | `/herald-digest <team>` | Full run: fetch, rate PRs, analyze, save report |
+| herald-analyze | (called by digest) | Produce digest markdown from activity JSON |
+| herald-rate-pr | (called by digest) | Rate one PR's relevance to a team (1-5) |
+| herald-config | `/herald-config` | Interactive team configuration builder |
+| herald-post | `/herald-post <file>` | Post digest to Teams (requires explicit request) |
 
 ## Configuration
 
-Herald splits configuration into two layers:
-
-- **`herald.config.json`** -- structural config (defaults + group stubs). Committed to the repo.
-- **`groups/*.json`** -- per-group configs with team context, repositories, and webhook URLs. Gitignored (except `groups/example.json`).
-
-This keeps secrets (webhook URLs) and team-specific data out of version control.
-
-### File structure
+Herald uses a layered config structure:
 
 ```
-herald.config.json          <-- committed, structural only
-herald.config.example.json  <-- committed, shows full structure
-groups/
-  example.json              <-- committed, template for new groups
-  my-team.json              <-- gitignored, your team's config
+config/
+  herald.json              main config (defaults + team list)
+  herald.example.json      example showing both patterns
+  teams/
+    team.example.json      per-team template
+    my-team.json           your team config (gitignored)
+  secrets/
+    secrets.example.json   webhook URL template
+    my-team.json           your webhook URL (gitignored)
 ```
 
-### herald.config.json (committed)
-
-Contains defaults and group stubs that reference external config files:
+### Main config: `config/herald.json`
 
 ```json
 {
@@ -94,243 +105,147 @@ Contains defaults and group stubs that reference external config files:
     "max_commits": 20,
     "activity_types": ["commits", "pulls", "issues", "releases"]
   },
-  "groups": [
-    { "name": "my-team", "config_file": "groups/my-team.json" }
+  "teams": [
+    { "name": "my-team", "config_file": "teams/my-team.json" }
   ]
 }
 ```
 
-### Group config file (gitignored)
+Teams can reference external files (`config_file`) or be defined inline with `sources` directly in the main config. See `config/herald.example.json` for both patterns.
 
-Each group file contains sources, team context, and optional webhook URL:
+### Team config: `config/teams/<name>.json`
 
 ```json
 {
-  "sources": [
-    {
-      "type": "github",
-      "repositories": ["owner/repo-1", "owner/repo-2"]
-    }
-  ],
-  "team_context": {
-    "name": "My Team",
-    "focus_areas": ["Area your team cares about"],
-    "priorities": ["Top priority (shown first in AI summaries)"]
+  "sources": [{
+    "type": "github",
+    "repositories": ["owner/repo-1", "owner/repo-2"],
+    "filters": {
+      "exclude_authors": ["dependabot[bot]"],
+      "exclude_titles": ["^build\\(deps\\):"],
+      "exclude_labels": ["wontfix"]
+    },
+    "diff_keywords": ["security", "breaking", "critical"],
+    "fetch_comments": true,
+    "deep_analysis": { "enabled": true, "clone_dir": ".cache/repos" }
+  }],
+  "display_name": "My Team",
+  "focus_areas": ["Area your team cares about"],
+  "priorities": ["Top priority (flagged in digests)", "Secondary priority"],
+  "sub_teams": []
+}
+```
+
+### Secrets: `config/secrets/<name>.json`
+
+```json
+{ "teams_webhook_url": "https://your-power-automate-webhook-url" }
+```
+
+### Key fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `time_window_days` | 14 | How far back to fetch |
+| `max_commits` | 20 | Per repo per request |
+| `activity_types` | all four | Subset of commits, pulls, issues, releases |
+| `exclude_authors` | [] | Skip activity from these users |
+| `exclude_titles` | [] | Regex patterns to skip by title |
+| `diff_keywords` | [] | Fetch diffs for PRs matching these keywords |
+| `fetch_comments` | false | Include recent PR/issue comments |
+| `deep_analysis.enabled` | false | Clone repos and read context files |
+| `display_name` | required | Team name shown in digests |
+| `focus_areas` | [] | Team's technical interests (fed to AI) |
+| `priorities` | [] | Ordered; first entry is flagged as high priority |
+| `sub_teams` | [] | Merge sources from other configured teams |
+
+## Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `GITHUB_TOKEN` | GitHub API auth (5000 req/hour vs 60) |
+| `HERALD_CONFIG` | Override config file path |
+| `HERALD_DAYS` | Override `time_window_days` |
+| `HERALD_MAX_COMMITS` | Override `max_commits` |
+| `HERALD_TEAMS_WEBHOOK` | Fallback webhook URL for all teams |
+
+## Activity JSON Schema
+
+`herald fetch` outputs a structured envelope consumed by skills:
+
+```json
+{
+  "meta": {
+    "team": "my-team",
+    "fetched_at": "2026-06-24T12:00:00+00:00",
+    "time_window_days": 14,
+    "since": "2026-06-10T12:00:00+00:00",
+    "team_context": { "name": "...", "focus_areas": [...], "priorities": [...] },
+    "stats": { "repos": 3, "commits": 42, "pulls": 12, "pulls_with_diffs": 4, "issues": 7, "releases": 1 }
   },
-  "teams_webhook_url": "https://..."
+  "activity": [
+    {
+      "repository": "owner/repo",
+      "source_type": "github",
+      "commits": [...],
+      "pulls": [...],
+      "issues": [...],
+      "releases": [...]
+    }
+  ]
 }
 ```
 
-### Creating a new group
-
-```bash
-cp groups/example.json groups/my-team.json
-# Edit groups/my-team.json with your repositories, team context, and webhook URL
-```
-
-Then add a stub to `herald.config.json`:
-
-```json
-{ "name": "my-team", "config_file": "groups/my-team.json" }
-```
-
-### Fields
-
-| Field | Description |
-|---|---|
-| `defaults.time_window_days` | Lookback period in days (default: 14) |
-| `defaults.max_commits` | Max commits fetched per repository (default: 20) |
-| `defaults.activity_types` | Subset of `["commits", "pulls", "issues", "releases"]` |
-| `defaults.ai_backend.type` | AI backend type (default: `"claude-cli"`) |
-| `defaults.ai_backend.timeout` | Backend timeout in seconds (default: 600) |
-| `groups[].name` | Identifier for the group (used in CLI and reports) |
-| `groups[].config_file` | Path to external group config (relative to config file) |
-| `groups[].sources[].type` | Source type (`"github"`) |
-| `groups[].sources[].repositories` | List of `owner/repo` strings |
-| `groups[].team_context.name` | Team display name used in prompts |
-| `groups[].team_context.focus_areas` | List of focus areas injected into the AI prompt |
-| `groups[].team_context.priorities` | Ordered list; first entry is flagged as critical priority |
-| `groups[].teams_webhook_url` | Power Automate webhook URL (optional) |
-
-### Inline groups
-
-Groups can also be defined inline in `herald.config.json` (useful for non-sensitive configs). See `herald.config.example.json` for an example showing both patterns.
-
-### Flat Config (Backward Compatible)
-
-Herald also accepts the legacy flat format with `repositories` at the top level. It will be wrapped as a single group named `"default"`:
-
-```json
-{
-  "repositories": ["owner/repo"],
-  "time_window_days": 14,
-  "max_commits": 20,
-  "activity_types": ["commits", "pulls", "issues", "releases"],
-  "team_context": { "name": "My Team", "priorities": ["..."] }
-}
-```
-
-## Reports
-
-Detailed raw activity reports are saved automatically to:
-
-```
-reports/
-  <group-name>/
-    herald-detailed-20260402_143000.md
-```
-
-The `reports/` directory is gitignored.
-
-## Automation
-
-### GitHub Actions
-
-The included workflow (`.github/workflows/herald.yml`) runs weekly on Monday at 9:00 UTC. It can also be triggered manually with custom inputs.
-
-Required secrets:
-- `ANTHROPIC_API_KEY` -- for Claude CLI
-
-Optional secrets:
-- `GITHUB_TOKEN` -- automatically provided by Actions; gives 5,000 req/hour rate limit
-
-Manual trigger inputs:
-- **days**: lookback period (default: 14)
-- **group**: specific group name (blank = all)
-- **force**: ignore cache (default: false)
-
-### Cron
-
-```bash
-# Weekly Monday 9am
-0 9 * * 1 cd /path/to/herald && python herald.py --output digest-$(date +\%Y\%m\%d).md
-```
+Commits that duplicate PR merge/head SHAs are automatically removed during fetch. See `schema/activity.json` for the full JSON Schema.
 
 ## Extending Herald
 
-### Adding a New Source
+### Adding a source type
 
-Create a subclass of `ActivitySource` and register it:
+Subclass `ActivitySource` and register it:
 
 ```python
 class GitLabSource(ActivitySource):
     source_type = "gitlab"
 
     def validate(self) -> bool:
-        # Validate config
         return True
 
     def fetch_activity(self, since: datetime) -> List[Dict[str, Any]]:
-        # Fetch from GitLab API
         return [{"repository": "...", "commits": [], "pulls": [], "issues": [], "releases": []}]
 
 SOURCE_REGISTRY["gitlab"] = GitLabSource
 ```
 
-Then use it in config:
-
-```json
-{
-  "sources": [
-    { "type": "gitlab", "repositories": ["group/project"] }
-  ]
-}
-```
-
-### Adding a Custom AI Backend
-
-Herald uses a pluggable AI backend system. The default is `claude-cli`, but you can add custom backends by subclassing `AIBackend`:
-
-```python
-class OllamaBackend(AIBackend):
-    backend_type = "ollama"
-
-    def validate(self) -> bool:
-        # Check if Ollama is running
-        return True
-
-    def summarize(self, prompt: str, label: str = "") -> Optional[str]:
-        # Call Ollama API and return the response text
-        return "..."
-
-AI_BACKEND_REGISTRY["ollama"] = OllamaBackend
-```
-
-Then set it in config:
-
-```json
-{
-  "defaults": {
-    "ai_backend": {
-      "type": "ollama",
-      "model": "llama2",
-      "api_url": "http://localhost:11434"
-    }
-  }
-}
-```
-
-The backend receives the full `ai_backend` config dict, so you can pass backend-specific options like model name, API URL, timeout, etc. Access them via `self.config.get("model")` in your backend class.
-
-### Custom Team Context
-
-The `team_context` block is injected directly into the AI prompt. The first entry in `priorities` is flagged as **CRITICAL PRIORITY** and those items appear first in the summary. Use this to tune the AI output for your team's needs.
-
-## Architecture
-
-```
-herald.py
-  ActivitySource (ABC)     -- cache helpers, abstract fetch_activity/validate
-  GitHubSource             -- GitHub REST API v3 fetcher
-  SOURCE_REGISTRY          -- maps type strings to source classes
-  AIBackend (ABC)          -- abstract base for AI summarization backends
-  ClaudeCLIBackend         -- Claude CLI subprocess backend (default)
-  AI_BACKEND_REGISTRY      -- maps type strings to backend classes
-  Herald                   -- orchestrator: config, groups, prompts, AI backend, reports, Teams
-  main()                   -- CLI argument parsing
-```
-
-**Data flow:**
-1. Config loaded from `herald.config.json`, resolved into groups
-2. Each group's sources fetch activity from their respective APIs (cached with 1-hour TTL)
-3. A detailed raw report is saved to `reports/<group>/`
-4. Activity + team context formatted into a prompt sent to the configured AI backend
-5. AI response is stripped of conversational preamble/postamble
-6. Final digest output to stdout/file; optionally posted to Teams
+Then use `"type": "gitlab"` in your team config sources.
 
 ## Troubleshooting
 
-### Claude CLI not found
-
-```bash
-npm install -g @anthropic-ai/claude-code
-claude auth login
-```
-
 ### GitHub rate limit exceeded
 
-Set `GITHUB_TOKEN` for 5,000 requests/hour (vs 60 unauthenticated):
-
 ```bash
-export GITHUB_TOKEN=your_token
-python herald.py
+export GITHUB_TOKEN=ghp_your_token
 ```
+
+This gives 5,000 requests/hour vs 60 unauthenticated. `python herald.py validate` will show your current status.
 
 ### No activity found
 
-- Verify repository names are in `owner/repo` format
-- Check that the time window includes recent activity (`--days 30`)
-- Ensure repositories are public or your token has access
+- Verify repository names are `owner/repo` format
+- Increase the window: `--days 30`
+- Check that repos are public or your token has access
 
 ### Cache
 
-Cache is stored in `.cache/` with a 1-hour TTL. To clear:
+Cache lives in `.cache/` with a 1-hour TTL. Files older than 7 days are pruned automatically.
 
 ```bash
+# Bypass cache for one run
+python herald.py fetch --team my-team --force
+
+# Clear cache entirely
 rm -rf .cache/
 ```
-
-Or use `--force` to bypass cache for a single run.
 
 ## License
 

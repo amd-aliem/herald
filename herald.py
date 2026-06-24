@@ -1045,12 +1045,43 @@ class Herald:
             return teams
         return self.teams
 
+    @staticmethod
+    def _preflight_check_team(team: Dict[str, Any]) -> bool:
+        """Quick validation before fetching. Returns False if team has problems."""
+        team_name = team.get("name", "unnamed")
+        sources = team.get("sources", [])
+        ok = True
+
+        if not sources:
+            logger.error("Team '%s' has no sources configured", team_name)
+            return False
+
+        for src in sources:
+            repos = src.get("repositories", [])
+            if not repos:
+                logger.error("Team '%s' has a source with no repositories", team_name)
+                ok = False
+            for repo in repos:
+                parts = repo.split('/')
+                if len(parts) != 2 or not all(parts):
+                    logger.error("Team '%s': invalid repository '%s' (expected owner/repo)",
+                                 team_name, repo)
+                    ok = False
+
+        return ok
+
     def fetch_team_activity(self, team: Dict[str, Any],
                             time_window_days: Optional[int] = None
                             ) -> Tuple[List[Dict[str, Any]], int, datetime]:
         """Fetch activity for one team. Returns (activity_list, days, since)."""
         team_name = team.get("name", "unnamed")
         defaults = self.get_defaults()
+
+        if not self._preflight_check_team(team):
+            logger.error("Skipping team '%s' due to config errors. "
+                         "Run 'python herald.py validate' for details.", team_name)
+            days = time_window_days or defaults.get("time_window_days", 14)
+            return [], days, datetime.now(timezone.utc) - timedelta(days=days)
 
         if time_window_days is None:
             time_window_days = team.get("time_window_days",
@@ -1394,7 +1425,14 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     fetch_parser = subparsers.add_parser(
-        "fetch", help="Fetch activity and write structured JSON"
+        "fetch", help="Fetch activity and write structured JSON",
+        description="Fetch activity from configured sources and write structured JSON.",
+        epilog="Examples:\n"
+               "  python herald.py fetch -t my-team\n"
+               "  python herald.py fetch -t my-team --days 7 --force -o activity.json\n"
+               "  python herald.py fetch -t team-a -t team-b\n"
+               "  python herald.py fetch --repos owner/repo1,owner/repo2\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_common_args(fetch_parser)
     fetch_parser.add_argument('--team', '-t', action='append',
@@ -1406,14 +1444,30 @@ def main():
     fetch_parser.add_argument('--output', '-o',
                               help='Output file (default: stdout for single team)')
 
-    list_parser = subparsers.add_parser("list-teams", help="List configured teams")
+    list_parser = subparsers.add_parser(
+        "list-teams", help="List configured teams",
+        description="Show all configured teams and their sources.",
+    )
     _add_common_args(list_parser)
 
-    validate_parser = subparsers.add_parser("validate", help="Validate configuration")
+    validate_parser = subparsers.add_parser(
+        "validate", help="Validate configuration",
+        description="Run pre-flight checks on config, secrets, and environment.",
+        epilog="Examples:\n"
+               "  python herald.py validate\n"
+               "  python herald.py validate --config /path/to/config.json\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     _add_common_args(validate_parser)
 
     post_parser = subparsers.add_parser(
-        "post", help="Post digest markdown to Microsoft Teams (reads stdin)"
+        "post", help="Post digest markdown to Microsoft Teams (reads stdin)",
+        description="Post a digest to Microsoft Teams via Power Automate webhook.\n"
+                    "Reads markdown from stdin.",
+        epilog="Examples:\n"
+               "  python herald.py post --team my-team < digest.md\n"
+               "  python herald.py post --webhook-url \"$URL\" < digest.md\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_common_args(post_parser)
     post_parser.add_argument('--team', '-t', help='Team name (loads webhook from secrets)')

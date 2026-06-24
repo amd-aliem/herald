@@ -1,5 +1,5 @@
 {
-    "defaults": {
+  "defaults": {
     "time_window_days": 14,
     "max_commits": 20,
     "activity_types": ["commits", "pulls", "issues", "releases"]
