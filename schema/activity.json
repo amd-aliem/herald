@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/amd-aliem/herald/schema/activity.json",
+  "title": "Herald Activity Envelope",
+  "description": "Structured activity data produced by `herald fetch` and consumed by Herald skills.",
+  "type": "object",
+  "required": ["meta", "activity"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["team", "fetched_at", "time_window_days", "since", "team_context"],
+      "properties": {
+        "team": {
+          "type": "string",
+          "description": "Team identifier from config"
+        },
+        "fetched_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC timestamp when activity was fetched"
+        },
+        "time_window_days": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Lookback window in days"
+        },
+        "since": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC start of the activity window"
+        },
+        "team_context": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "focus_areas": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "priorities": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "activity": {
+      "type": "array",
+      "description": "Per-repository activity blobs from ActivitySource.fetch_activity()",
+      "items": {
+        "type": "object",
+        "required": ["repository", "source_type", "since"],
+        "properties": {
+          "repository": { "type": "string" },
+          "source_type": { "type": "string" },
+          "since": { "type": "string" },
+          "commits": { "type": "array" },
+          "pulls": { "type": "array" },
+          "issues": { "type": "array" },
+          "releases": { "type": "array" },
+          "_herald_repo_context": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

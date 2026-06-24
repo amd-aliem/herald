@@ -1155,6 +1155,118 @@ class Herald:
 
         return valid
 
+    def _resolve_teams_to_process(self, team_names: Optional[List[str]] = None,
+                                   repositories: Optional[List[str]] = None
+                                   ) -> List[Dict[str, Any]]:
+        if repositories:
+            return [{
+                "name": "cli-repos",
+                "sources": [{"type": "github", "repositories": repositories}],
+                "team_context": {},
+            }]
+        if team_names:
+            teams = [t for t in self.teams if t.get("name") in team_names]
+            missing = set(team_names) - {t.get("name") for t in teams}
+            if missing:
+                logger.warning("Teams not found: %s", ', '.join(missing))
+            return teams
+        return self.teams
+
+    def fetch_team_activity(self, team: Dict[str, Any],
+                            time_window_days: Optional[int] = None
+                            ) -> Tuple[List[Dict[str, Any]], int, datetime]:
+        """Fetch activity for one team. Returns (activity_list, days, since)."""
+        team_name = team.get("name", "unnamed")
+        defaults = self.get_defaults()
+
+        if time_window_days is None:
+            time_window_days = team.get("time_window_days",
+                                          defaults.get("time_window_days", 14))
+
+        since = datetime.now(timezone.utc) - timedelta(days=time_window_days)
+        all_activity: List[Dict[str, Any]] = []
+
+        for src_config in team.get("sources", []):
+            src_type = src_config.get("type", "github")
+            source_cls = SOURCE_REGISTRY.get(src_type)
+            if not source_cls:
+                logger.warning("Unknown source type '%s', skipping", src_type)
+                continue
+
+            merged_config = {**defaults, **src_config}
+            source = source_cls(merged_config, self.cache_dir, self.force_refresh)
+
+            if not source.validate():
+                logger.error("Source validation failed for %s in team %s",
+                             src_type, team_name)
+                continue
+
+            all_activity.extend(source.fetch_activity(since))
+
+        return all_activity, time_window_days, since
+
+    @staticmethod
+    def serialize_activity(team: Dict[str, Any], activity_list: List[Dict[str, Any]],
+                           time_window_days: int, since: datetime) -> Dict[str, Any]:
+        """Build the activity JSON envelope written by `herald fetch`."""
+        team_name = team.get("name", "unnamed")
+        return {
+            "meta": {
+                "team": team_name,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "time_window_days": time_window_days,
+                "since": since.isoformat(),
+                "team_context": Herald._resolve_team_context(team),
+            },
+            "activity": activity_list,
+        }
+
+    @staticmethod
+    def deserialize_activity(data: Dict[str, Any]) -> Tuple[Dict[str, Any],
+                                                             List[Dict[str, Any]]]:
+        """Parse activity JSON envelope into (meta, activity_list)."""
+        meta = data.get("meta", {})
+        activity = data.get("activity", [])
+        if not isinstance(activity, list):
+            raise ValueError("activity must be a list")
+        return meta, activity
+
+    def fetch_teams(self, team_names: Optional[List[str]] = None,
+                    repositories: Optional[List[str]] = None,
+                    time_window_days: Optional[int] = None,
+                    output_path: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch activity for one or more teams and return JSON envelopes."""
+        teams = self._resolve_teams_to_process(team_names, repositories)
+        if not teams:
+            logger.error("No teams to process.")
+            sys.exit(1)
+
+        envelopes: List[Dict[str, Any]] = []
+        for team in teams:
+            activity, days, since = self.fetch_team_activity(team, time_window_days)
+            envelopes.append(self.serialize_activity(team, activity, days, since))
+
+        if len(teams) == 1:
+            payload = envelopes[0]
+            text = json.dumps(payload, indent=2) + "\n"
+            if output_path:
+                path = Path(output_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                logger.info("Wrote activity JSON: %s", path)
+            else:
+                print(text, end="")
+            return envelopes
+
+        for envelope in envelopes:
+            safe = envelope["meta"]["team"].replace(' ', '-').lower()
+            path = Path(output_path) if output_path else self.cache_dir / f"activity-{safe}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(envelope, indent=2) + "\n", encoding="utf-8")
+            logger.info("Wrote activity JSON: %s", path)
+
+        return envelopes
+
     def list_teams(self):
         """Print configured teams and exit."""
         if not self.teams:
@@ -1825,109 +1937,29 @@ def _migrate_config_layout():
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Herald - Multi-Source Repository Activity Tracker"
-    )
-    parser.add_argument(
-        '--config',
-        help='Path to configuration file'
-    )
-    parser.add_argument(
-        '--repos',
-        help='Comma-separated list of repositories (owner/repo). Overrides configured teams.'
-    )
-    parser.add_argument(
-        '--days',
-        type=int,
-        help='Number of days to look back (default: 14)'
-    )
-    parser.add_argument(
-        '--output',
-        help='Output file path (default: stdout)'
-    )
-    parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force regenerate summaries, ignoring cache'
-    )
-    parser.add_argument(
-        '--teams',
-        action='store_true',
-        help='Post digest to Microsoft Teams via Power Automate webhook'
-    )
-    parser.add_argument(
-        '--team', '-t',
-        action='append',
-        dest='team',
-        help='Run only specific team(s) by name (can be repeated)'
-    )
-    parser.add_argument(
-        '--group', '-g',
-        action='append',
-        dest='team',
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        '--list-teams',
-        action='store_true',
-        help='Print configured teams and exit'
-    )
-    parser.add_argument(
-        '--list-groups',
-        action='store_true',
-        help=argparse.SUPPRESS,
-    )
+def _add_common_args(parser: argparse.ArgumentParser):
+    parser.add_argument('--config', help='Path to configuration file')
+    parser.add_argument('--force', action='store_true',
+                        help='Bypass activity cache')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='Suppress informational messages')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable debug logging')
 
-    parser.add_argument(
-        '--validate',
-        action='store_true',
-        help='Validate configuration and prerequisites, then exit'
-    )
-    parser.add_argument(
-        '--quiet', '-q',
-        action='store_true',
-        help='Suppress informational messages'
-    )
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        help='Enable debug logging'
-    )
 
-    args = parser.parse_args()
-
-    setup_logging(verbose=args.verbose, quiet=args.quiet)
-
-    _migrate_config_layout()
-
-    config_path = args.config or os.environ.get("HERALD_CONFIG")
-
-    # Initialize
-    herald = Herald(config_path=config_path, force_refresh=args.force)
-
-    if args.list_teams or args.list_groups:
-        herald.list_teams()
-        return
-
-    if args.validate:
-        valid = herald.validate()
-        sys.exit(0 if valid else 1)
-
-    # Parse repositories
+def _run_legacy_digest(herald: Herald, args: argparse.Namespace):
+    logger.warning("Top-level digest flags are deprecated. "
+                   "Use `/herald-digest` skill or legacy mode until Phase 4 removal.")
     repositories = None
     if args.repos:
         repositories = [r.strip() for r in args.repos.split(',')]
 
-    # Generate digest
     output = herald.generate_digest(
         team_names=args.team,
         repositories=repositories,
-        time_window_days=args.days
+        time_window_days=args.days,
     )
 
-    # Output summary
     if args.output:
         with open(args.output, 'w') as f:
             f.write(output)
@@ -1937,16 +1969,101 @@ def main():
         print(output)
         print("=" * 80)
 
-    # Post to Teams if requested
     if args.teams:
         if herald.all_summaries_failed:
             logger.warning("Skipping Teams post: AI summary generation failed.")
         else:
-            # Post to each team's webhook
             for team in herald.teams:
                 webhook = team.get("teams_webhook_url")
                 if webhook:
                     herald.post_to_teams(output, webhook)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Herald - Multi-Source Repository Activity Tracker"
+    )
+    parser.add_argument('-q', '--quiet', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('-v', '--verbose', action='store_true', help=argparse.SUPPRESS)
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    fetch_parser = subparsers.add_parser(
+        "fetch", help="Fetch activity and write structured JSON"
+    )
+    _add_common_args(fetch_parser)
+    fetch_parser.add_argument('--team', '-t', action='append',
+                              help='Team name (repeatable; default: all teams)')
+    fetch_parser.add_argument('--repos',
+                              help='Comma-separated repositories (overrides teams)')
+    fetch_parser.add_argument('--days', type=int,
+                              help='Number of days to look back')
+    fetch_parser.add_argument('--output', '-o',
+                              help='Output file (default: stdout for single team)')
+
+    list_parser = subparsers.add_parser("list-teams", help="List configured teams")
+    _add_common_args(list_parser)
+
+    validate_parser = subparsers.add_parser("validate", help="Validate configuration")
+    _add_common_args(validate_parser)
+
+    # Legacy top-level flags (deprecated digest path)
+    parser.add_argument('--config', help=argparse.SUPPRESS)
+    parser.add_argument('--repos', help=argparse.SUPPRESS)
+    parser.add_argument('--days', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--output', help=argparse.SUPPRESS)
+    parser.add_argument('--force', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--teams', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--team', '-t', action='append', dest='team', help=argparse.SUPPRESS)
+    parser.add_argument('--group', '-g', action='append', dest='team', help=argparse.SUPPRESS)
+    parser.add_argument('--list-teams', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--list-groups', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--validate', action='store_true', help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    setup_logging(verbose=args.verbose, quiet=args.quiet)
+    _migrate_config_layout()
+
+    config_path = args.config or os.environ.get("HERALD_CONFIG")
+    herald = Herald(config_path=config_path, force_refresh=args.force)
+
+    if args.command == "fetch":
+        repositories = None
+        if args.repos:
+            repositories = [r.strip() for r in args.repos.split(',')]
+        herald.fetch_teams(
+            team_names=args.team,
+            repositories=repositories,
+            time_window_days=args.days,
+            output_path=args.output,
+        )
+        return
+
+    if args.command == "list-teams":
+        herald.list_teams()
+        return
+
+    if args.command == "validate":
+        sys.exit(0 if herald.validate() else 1)
+
+    # Legacy hidden flags
+    if args.list_teams or args.list_groups:
+        herald.list_teams()
+        return
+    if args.validate:
+        sys.exit(0 if herald.validate() else 1)
+
+    legacy_digest = any([
+        args.repos, args.days is not None, args.output,
+        args.teams, args.team, args.force,
+    ])
+    if legacy_digest or args.command is None:
+        _run_legacy_digest(herald, args)
+        return
+
+    parser.print_help()
 
 
 if __name__ == '__main__':
