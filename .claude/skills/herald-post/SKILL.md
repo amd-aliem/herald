@@ -1,7 +1,7 @@
 ---
 name: herald-post
 description: Post a Herald digest markdown file to Microsoft Teams.
-allowed-tools: Bash(python herald.py *), Read
+allowed-tools: Bash(python herald.py *), Read, AskUserQuestion
 user-invocable: true
 ---
 
@@ -11,27 +11,34 @@ Post a digest markdown file to Microsoft Teams via Power Automate webhook.
 
 ## Arguments
 
-`<digest-file>` and either `--team TEAM` (loads webhook from `config/secrets/<team>.json`) or `--webhook-url URL`.
+`<digest-file>` and either `--team TEAM` or `--webhook-url URL`.
 
 Only run when the user explicitly requests Teams delivery.
 
 ## Procedure
 
-1. Verify the digest file exists and is non-empty.
-2. Resolve webhook URL:
-   - `--team <name>` → read `config/secrets/<name>.json` for `teams_webhook_url`
-   - or use `HERALD_TEAMS_WEBHOOK` env var
-   - or `--webhook-url` argument
-3. Post via the Python helper (Adaptive Card conversion stays in Python):
+1. **Validate digest** — Read the file. Verify it exists and is non-empty. The Python `post` command also warns if the content doesn't start with `**TL;DR:**`.
+
+2. **Resolve webhook** (first match wins):
+   - `--webhook-url URL` — use directly
+   - `--team <name>` — read `config/secrets/<name>.json` for `teams_webhook_url`
+   - `HERALD_TEAMS_WEBHOOK` env var
+   - If none found, tell the user and stop.
+
+3. **Confirm** — Use AskUserQuestion: "Post digest `<filename>` to `<team>` Teams channel?" with options Yes / No. Stop if declined.
+
+4. **Post**:
    ```bash
-   python herald.py post --team <team> < digest.md
+   python herald.py post --team <team> < <digest-file>
    ```
-   or
+   or with explicit URL:
    ```bash
-   python herald.py post --webhook-url "$URL" < digest.md
+   python herald.py post --webhook-url "$URL" < <digest-file>
    ```
-4. Report success or HTTP error to the user.
+
+5. **Report result** — If exit code 0, confirm success. Otherwise, show the error output from stderr.
 
 ## Safety
 
-Do not post unless explicitly requested. Never log or echo the full webhook URL.
+- Never post without explicit user request AND confirmation.
+- Never log or echo the full webhook URL.

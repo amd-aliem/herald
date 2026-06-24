@@ -42,6 +42,18 @@
               "items": { "type": "string" }
             }
           }
+        },
+        "stats": {
+          "type": "object",
+          "description": "Summary counts computed by fetch (after filtering and dedup)",
+          "properties": {
+            "repos": { "type": "integer" },
+            "commits": { "type": "integer" },
+            "pulls": { "type": "integer" },
+            "pulls_with_diffs": { "type": "integer" },
+            "issues": { "type": "integer" },
+            "releases": { "type": "integer" }
+          }
         }
       }
     },

@@ -613,6 +613,40 @@ class GitHubSource(ActivitySource):
 
     # -- main fetch_activity implementation --
 
+    @staticmethod
+    def _dedup_commits(activity: Dict[str, Any]) -> int:
+        """Remove commits whose SHAs appear as a PR merge or head commit.
+
+        Returns the number of commits removed.
+        """
+        commits = activity.get("commits", [])
+        pulls = activity.get("pulls", [])
+        if not commits or not pulls:
+            return 0
+
+        pr_shas: set = set()
+        for pr in pulls:
+            for key in ("merge_commit_sha", "head"):
+                val = pr.get(key)
+                if isinstance(val, str) and val:
+                    pr_shas.add(val)
+                elif isinstance(val, dict):
+                    sha = val.get("sha")
+                    if sha:
+                        pr_shas.add(sha)
+
+        if not pr_shas:
+            return 0
+
+        before = len(commits)
+        activity["commits"] = [
+            c for c in commits if c.get("sha") not in pr_shas
+        ]
+        removed = before - len(activity["commits"])
+        if removed:
+            logger.debug("  Deduped %d commit(s) already covered by PRs", removed)
+        return removed
+
     def fetch_activity(self, since: datetime) -> List[Dict[str, Any]]:
         """Fetch activity for all configured repositories."""
         results = []
@@ -642,6 +676,7 @@ class GitHubSource(ActivitySource):
                 logger.info("  Found %d releases", len(activity['releases']))
 
             activity = self.apply_filters(activity)
+            self._dedup_commits(activity)
 
             if "pulls" in activity and self._diff_keywords_lower:
                 self.enrich_prs_with_diffs(repo, activity["pulls"])
@@ -1044,6 +1079,33 @@ class Herald:
         return all_activity, time_window_days, since
 
     @staticmethod
+    def _compute_stats(activity_list: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Compute summary stats across all repos in an activity list."""
+        repos = len(activity_list)
+        total_commits = 0
+        total_prs = 0
+        total_issues = 0
+        total_releases = 0
+        prs_with_diffs = 0
+
+        for repo_activity in activity_list:
+            total_commits += len(repo_activity.get("commits", []))
+            pulls = repo_activity.get("pulls", [])
+            total_prs += len(pulls)
+            prs_with_diffs += sum(1 for p in pulls if "_herald_diff" in p)
+            total_issues += len(repo_activity.get("issues", []))
+            total_releases += len(repo_activity.get("releases", []))
+
+        return {
+            "repos": repos,
+            "commits": total_commits,
+            "pulls": total_prs,
+            "pulls_with_diffs": prs_with_diffs,
+            "issues": total_issues,
+            "releases": total_releases,
+        }
+
+    @staticmethod
     def serialize_activity(team: Dict[str, Any], activity_list: List[Dict[str, Any]],
                            time_window_days: int, since: datetime) -> Dict[str, Any]:
         """Build the activity JSON envelope written by `herald fetch`."""
@@ -1055,6 +1117,7 @@ class Herald:
                 "time_window_days": time_window_days,
                 "since": since.isoformat(),
                 "team_context": Herald._resolve_team_context(team),
+                "stats": Herald._compute_stats(activity_list),
             },
             "activity": activity_list,
         }
@@ -1391,6 +1454,9 @@ def main():
         if not digest.strip():
             logger.error("No digest content on stdin")
             sys.exit(1)
+        if not digest.lstrip().startswith("**TL;DR:**"):
+            logger.warning("Digest does not start with '**TL;DR:**' — "
+                           "this may not be a Herald digest")
         webhook = args.webhook_url or os.environ.get("HERALD_TEAMS_WEBHOOK")
         if not webhook and args.team:
             secrets_path = herald.config_dir / "secrets" / f"{args.team}.json"
