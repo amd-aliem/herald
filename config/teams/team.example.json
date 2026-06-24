@@ -1,0 +1,19 @@
+{
+  "sources": [
+    {
+      "type": "github",
+      "repositories": [
+        "owner/repo"
+      ]
+    }
+  ],
+  "team_context": {
+    "name": "My Team",
+    "focus_areas": [
+      "Your focus area"
+    ],
+    "priorities": [
+      "Your top priority"
+    ]
+  }
+}

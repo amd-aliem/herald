@@ -7,5 +7,12 @@ venv/
 .env
 .DS_Store
 herald.config.json
+config/herald.json
+config/teams/*.json
+!config/teams/*.example.json
+!config/teams/team.example.json
+config/secrets/*.json
+!config/secrets/*.example.json
+!config/secrets/secrets.example.json
 groups/*.json
 !groups/example.json

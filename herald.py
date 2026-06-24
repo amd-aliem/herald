@@ -4,7 +4,9 @@ Herald - Multi-Source Repository Activity Tracker
 Fetches recent activity from configured sources and generates AI-powered summaries.
 """
 
+import copy
 import json
+import logging
 import sys
 import os
 import argparse
@@ -29,12 +31,93 @@ except ImportError:
     print("Error: 'python-dateutil' module not found. Install with: pip install python-dateutil")
     sys.exit(1)
 
+logger = logging.getLogger("herald")
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 RAW_ACTIVITY_HEADER = "**Raw Activity Data:**"
+SECRET_FIELD_NAMES = {"teams_webhook_url"}
+
+CONFIG_SEARCH_PATHS = [
+    "./config/herald.json",
+    "./herald.config.json",
+    str(Path.home() / ".config" / "herald" / "herald.json"),
+    str(Path.home() / ".herald.config.json"),
+]
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "defaults": {
+        "time_window_days": 14,
+        "max_commits": 20,
+        "activity_types": ["commits", "pulls", "issues", "releases"],
+        "ai_backend": {
+            "type": "claude-cli",
+            "timeout": 600,
+        },
+    },
+    "teams": [],
+}
+
+
+class _ColorFormatter(logging.Formatter):
+    """Compact, color-coded log formatter for interactive terminal use."""
+
+    COLORS = {
+        logging.DEBUG:    "\033[2m",
+        logging.INFO:     "\033[36m",
+        logging.WARNING:  "\033[33m",
+        logging.ERROR:    "\033[31m",
+        logging.CRITICAL: "\033[1;31m",
+    }
+    RESET = "\033[0m"
+
+    def __init__(self, use_color: bool = True):
+        super().__init__()
+        self.use_color = use_color and sys.stderr.isatty()
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if not self.use_color:
+            return f"{record.levelname}: {msg}"
+        color = self.COLORS.get(record.levelno, "")
+        return f"{color}{msg}{self.RESET}"
+
+
+def setup_logging(verbose: bool = False, quiet: bool = False):
+    """Configure logging for Herald. Logs go to stderr so stdout stays clean."""
+    herald_logger = logging.getLogger("herald")
+
+    if verbose:
+        herald_logger.setLevel(logging.DEBUG)
+    elif quiet:
+        herald_logger.setLevel(logging.WARNING)
+    else:
+        herald_logger.setLevel(logging.INFO)
+
+    if not any(isinstance(h, logging.StreamHandler) for h in herald_logger.handlers):
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(_ColorFormatter())
+        herald_logger.addHandler(stderr_handler)
+
+
+def _get_pr_state(pr: Dict[str, Any]) -> str:
+    """Determine PR state: 'merged' if merged_at is set, otherwise return PR state."""
+    return "merged" if pr.get("merged_at") else pr.get("state", "unknown")
+
+
+def _build_github_headers(accept: str = "application/vnd.github.v3+json") -> Dict[str, str]:
+    """Build GitHub API request headers with optional auth token."""
+    headers = {
+        "Accept": accept,
+        "User-Agent": "Herald/2.0",
+    }
+    github_token = os.environ.get('GITHUB_TOKEN')
+    if github_token:
+        headers["Authorization"] = f"token {github_token}"
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -107,27 +190,50 @@ class GitHubSource(ActivitySource):
         self.max_commits: int = config.get("max_commits", 20)
         self.activity_types: List[str] = config.get("activity_types",
                                                      ["commits", "pulls", "issues", "releases"])
+        filters = config.get("filters", {})
+        self.exclude_authors: List[str] = filters.get("exclude_authors", [])
+        self.exclude_titles: List[str] = filters.get("exclude_titles", [])
+        self.exclude_labels: List[str] = filters.get("exclude_labels", [])
+
+        self._compiled_title_patterns = []
+        for pattern in self.exclude_titles:
+            try:
+                self._compiled_title_patterns.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as e:
+                logger.warning("Invalid regex pattern '%s' in exclude_titles: %s (skipping)",
+                               pattern, e)
+        self._exclude_authors_set = set(self.exclude_authors)
+        self._exclude_labels_set = set(self.exclude_labels)
+
+        self.diff_keywords: List[str] = config.get("diff_keywords", [])
+        self.max_diff_size: int = config.get("max_diff_size", 50000)
+        self._diff_keywords_lower = [kw.lower() for kw in self.diff_keywords]
+
+        self.fetch_comments: bool = config.get("fetch_comments", False)
+        self.max_comments_per_item: int = config.get("max_comments_per_item", 5)
+
+        deep = config.get("deep_analysis", {})
+        self.deep_analysis_enabled: bool = deep.get("enabled", False)
+        self.deep_clone_dir: Path = Path(deep.get("clone_dir", str(cache_dir / "repos")))
+        self.deep_context_files: List[str] = deep.get("context_files", [
+            "CLAUDE.md", "README.md", "README.rst", "ARCHITECTURE.md",
+            "CONTRIBUTING.md", "docs/architecture.md",
+        ])
+        self.deep_max_file_size: int = deep.get("max_file_size", 50000)
 
     def validate(self) -> bool:
         valid = True
         for repo in self.repositories:
             parts = repo.split('/')
             if len(parts) != 2 or not all(parts):
-                print(f"Error: Invalid repository format: {repo} (expected owner/repo)")
+                logger.error("Invalid repository format: %s (expected owner/repo)", repo)
                 valid = False
+        if valid and not os.environ.get('GITHUB_TOKEN'):
+            logger.info("Tip: export GITHUB_TOKEN=... for higher rate limits")
         return valid
 
-    # -- GitHub API helpers --
-
     def github_request(self, url: str, params: Optional[Dict] = None) -> Optional[Any]:
-        headers = {
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Herald/2.0"
-        }
-
-        github_token = os.environ.get('GITHUB_TOKEN')
-        if github_token:
-            headers["Authorization"] = f"token {github_token}"
+        headers = _build_github_headers()
 
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
@@ -138,152 +244,378 @@ class GitHubSource(ActivitySource):
                     reset_time = response.headers.get('X-RateLimit-Reset', 'unknown')
                     if reset_time != 'unknown':
                         reset_dt = datetime.fromtimestamp(int(reset_time))
-                        print(f"Error: GitHub API rate limit exceeded. Resets at {reset_dt}")
+                        logger.error("GitHub API rate limit exceeded. Resets at %s", reset_dt)
                     else:
-                        print("Error: GitHub API rate limit exceeded.")
+                        logger.error("GitHub API rate limit exceeded.")
                     return None
 
             if response.status_code == 404:
-                print(f"Error: Resource not found (404): {url}")
+                logger.error("Resource not found (404): %s", url)
                 return None
 
             response.raise_for_status()
             return response.json()
 
         except requests.exceptions.Timeout:
-            print(f"Error: Request timeout for {url}")
+            logger.error("Request timeout for %s", url)
             return None
         except requests.exceptions.RequestException as e:
-            print(f"Error: Request failed for {url}: {e}")
+            logger.error("Request failed for %s: %s", url, e)
             return None
 
-    # -- per-activity-type fetchers --
+    def github_request_paginated(self, url: str, params: Optional[Dict] = None,
+                                    max_pages: int = 5) -> Optional[List[Dict]]:
+        """Fetch paginated GitHub API results using page numbers."""
+        all_results: List[Dict] = []
+        page_params = dict(params or {})
+        per_page = int(page_params.get("per_page", 100))
 
-    def fetch_commits(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "commits")
+        for page in range(1, max_pages + 1):
+            page_params["page"] = page
+            data = self.github_request(url, page_params)
+
+            if data is None or not isinstance(data, list):
+                if page == 1:
+                    return None
+                break
+
+            all_results.extend(data)
+
+            if len(data) < per_page:
+                break
+
+        return all_results
+
+    def _fetch_with_cache(self, repo: str, activity_type: str, url: str,
+                          params: Dict, paginated: bool = False,
+                          filter_fn=None) -> List[Dict]:
+        """Generic fetch-with-cache pattern used by all activity type fetchers."""
+        cache_path = self.get_cache_path(repo, activity_type)
 
         if self.is_cache_valid(cache_path):
             cached_data = self.load_cache(cache_path)
-            if cached_data:
-                print(f"  Using cached commits data")
+            if cached_data is not None:
+                logger.debug("Using cached %s data", activity_type)
+                if filter_fn:
+                    cached_data = filter_fn(cached_data)
                 return cached_data
 
-        url = f"https://api.github.com/repos/{repo}/commits"
-        params = {
-            "since": since.isoformat(),
-            "per_page": self.max_commits
-        }
+        if paginated:
+            data = self.github_request_paginated(url, params)
+            fetch_failed = data is None
+        else:
+            data = self.github_request(url, params)
+            fetch_failed = data is None
 
-        data = self.github_request(url, params)
-        if data is None:
+        if fetch_failed:
             stale_cache = self.load_cache(cache_path)
             if stale_cache:
-                print(f"  Using stale cache for commits")
+                logger.debug("Using stale cache for %s", activity_type)
+                if filter_fn:
+                    stale_cache = filter_fn(stale_cache)
                 return stale_cache
             return []
 
         self.save_cache(cache_path, data)
+
+        if filter_fn:
+            data = filter_fn(data)
         return data
 
+    def fetch_commits(self, repo: str, since: datetime) -> List[Dict]:
+        url = f"https://api.github.com/repos/{repo}/commits"
+        params = {"since": since.isoformat(), "per_page": self.max_commits}
+        return self._fetch_with_cache(repo, "commits", url, params)
+
     def fetch_pulls(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "pulls")
-
-        if self.is_cache_valid(cache_path):
-            cached_data = self.load_cache(cache_path)
-            if cached_data:
-                print(f"  Using cached pull requests data")
-                return cached_data
-
         url = f"https://api.github.com/repos/{repo}/pulls"
-        params = {
-            "state": "all",
-            "sort": "updated",
-            "direction": "desc",
-            "per_page": 100
-        }
-
-        data = self.github_request(url, params)
-        if data is None:
-            stale_cache = self.load_cache(cache_path)
-            if stale_cache:
-                print(f"  Using stale cache for pull requests")
-                return stale_cache
-            return []
-
-        filtered = []
-        for pr in data:
-            updated_at = date_parser.parse(pr['updated_at'])
-            if updated_at >= since:
-                filtered.append(pr)
-
-        self.save_cache(cache_path, filtered)
-        return filtered
+        params = {"state": "all", "sort": "updated",
+                  "direction": "desc", "per_page": 100}
+        return self._fetch_with_cache(
+            repo, "pulls", url, params, paginated=True,
+            filter_fn=lambda data: [
+                pr for pr in data
+                if date_parser.parse(pr['updated_at']) >= since
+            ],
+        )
 
     def fetch_issues(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "issues")
-
-        if self.is_cache_valid(cache_path):
-            cached_data = self.load_cache(cache_path)
-            if cached_data:
-                print(f"  Using cached issues data")
-                return cached_data
-
         url = f"https://api.github.com/repos/{repo}/issues"
-        params = {
-            "state": "all",
-            "sort": "updated",
-            "direction": "desc",
-            "per_page": 100
-        }
-
-        data = self.github_request(url, params)
-        if data is None:
-            stale_cache = self.load_cache(cache_path)
-            if stale_cache:
-                print(f"  Using stale cache for issues")
-                return stale_cache
-            return []
-
-        filtered = []
-        for issue in data:
-            if 'pull_request' in issue:
-                continue
-            updated_at = date_parser.parse(issue['updated_at'])
-            if updated_at >= since:
-                filtered.append(issue)
-
-        self.save_cache(cache_path, filtered)
-        return filtered
+        params = {"state": "all", "sort": "updated",
+                  "direction": "desc", "per_page": 100}
+        return self._fetch_with_cache(
+            repo, "issues", url, params, paginated=True,
+            filter_fn=lambda data: [
+                issue for issue in data
+                if 'pull_request' not in issue
+                and date_parser.parse(issue['updated_at']) >= since
+            ],
+        )
 
     def fetch_releases(self, repo: str, since: datetime) -> List[Dict]:
-        cache_path = self.get_cache_path(repo, "releases")
-
-        if self.is_cache_valid(cache_path):
-            cached_data = self.load_cache(cache_path)
-            if cached_data:
-                print(f"  Using cached releases data")
-                return cached_data
-
         url = f"https://api.github.com/repos/{repo}/releases"
         params = {"per_page": 10}
+        return self._fetch_with_cache(
+            repo, "releases", url, params,
+            filter_fn=lambda data: [
+                r for r in data
+                if r['published_at']
+                and date_parser.parse(r['published_at']) >= since
+            ],
+        )
 
-        data = self.github_request(url, params)
-        if data is None:
-            stale_cache = self.load_cache(cache_path)
-            if stale_cache:
-                print(f"  Using stale cache for releases")
-                return stale_cache
-            return []
+    def _has_filters(self) -> bool:
+        return bool(self._exclude_authors_set or self._compiled_title_patterns
+                     or self._exclude_labels_set)
 
-        filtered = []
-        for release in data:
-            if release['published_at']:
-                published_at = date_parser.parse(release['published_at'])
-                if published_at >= since:
-                    filtered.append(release)
+    def apply_filters(self, activity: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply exclude filters to fetched activity data."""
+        if not self._has_filters():
+            return activity
 
-        self.save_cache(cache_path, filtered)
-        return filtered
+        removed = 0
+
+        def _match_title(text: str) -> bool:
+            return any(p.search(text) for p in self._compiled_title_patterns)
+
+        def _match_author(author: str) -> bool:
+            return author in self._exclude_authors_set
+
+        def _match_labels(item: Dict) -> bool:
+            if not self.exclude_labels:
+                return False
+            item_labels = {lbl.get("name", "") for lbl in item.get("labels", [])}
+            return bool(item_labels & self._exclude_labels_set)
+
+        if "commits" in activity:
+            original = len(activity["commits"])
+            activity["commits"] = [
+                c for c in activity["commits"]
+                if not (
+                    _match_author(c.get("commit", {}).get("author", {}).get("name", ""))
+                    or _match_title(c.get("commit", {}).get("message", "").split("\n")[0])
+                )
+            ]
+            removed += original - len(activity["commits"])
+
+        for key in ("pulls", "issues"):
+            if key in activity:
+                original = len(activity[key])
+                activity[key] = [
+                    item for item in activity[key]
+                    if not (
+                        _match_author(item.get("user", {}).get("login", ""))
+                        or _match_title(item.get("title", ""))
+                        or _match_labels(item)
+                    )
+                ]
+                removed += original - len(activity[key])
+
+        if removed:
+            logger.info("  Filtered %d items", removed)
+
+        return activity
+
+    def _pr_matches_keywords(self, pr: Dict) -> bool:
+        title = (pr.get("title") or "").lower()
+        body = (pr.get("body") or "").lower()
+        text = f"{title} {body}"
+        return any(kw in text for kw in self._diff_keywords_lower)
+
+    def _fetch_pr_diff(self, repo: str, pr_number: int) -> Optional[str]:
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+        headers = _build_github_headers("application/vnd.github.v3.diff")
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code != 200:
+                logger.debug("Failed to fetch diff for %s#%d: HTTP %d",
+                             repo, pr_number, response.status_code)
+                return None
+            return response.text
+        except requests.exceptions.RequestException as e:
+            logger.debug("Failed to fetch diff for %s#%d: %s", repo, pr_number, e)
+            return None
+
+    def _fetch_pr_files(self, repo: str, pr_number: int) -> Optional[List[Dict]]:
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
+        data = self.github_request_paginated(url, {"per_page": 100}, max_pages=3)
+        return data if data else None
+
+    def _format_file_summary(self, files: List[Dict]) -> str:
+        lines = []
+        total_additions = 0
+        total_deletions = 0
+        for f in files:
+            status = f.get("status", "modified")
+            additions = f.get("additions", 0)
+            deletions = f.get("deletions", 0)
+            total_additions += additions
+            total_deletions += deletions
+            lines.append(f"  {status}: {f.get('filename', '?')} "
+                         f"(+{additions}/-{deletions})")
+        header = (f"  {len(files)} files changed, "
+                  f"+{total_additions}/-{total_deletions} lines")
+        return header + "\n" + "\n".join(lines)
+
+    def enrich_prs_with_diffs(self, repo: str, pulls: List[Dict]) -> None:
+        if not self._diff_keywords_lower:
+            return
+
+        enriched = 0
+        for pr in pulls:
+            is_merged = bool(pr.get("merged_at"))
+            if not self._pr_matches_keywords(pr):
+                continue
+            if not is_merged and pr.get("state") != "open":
+                continue
+
+            pr_number = pr.get("number")
+            if not pr_number:
+                continue
+
+            diff_text = self._fetch_pr_diff(repo, pr_number)
+            if diff_text is None:
+                continue
+
+            if len(diff_text) <= self.max_diff_size:
+                pr["_herald_diff"] = diff_text
+                pr["_herald_diff_type"] = "full"
+            else:
+                files = self._fetch_pr_files(repo, pr_number)
+                if files:
+                    pr["_herald_diff"] = self._format_file_summary(files)
+                    pr["_herald_diff_type"] = "summary"
+                else:
+                    pr["_herald_diff"] = diff_text[:self.max_diff_size] + "\n... [truncated]"
+                    pr["_herald_diff_type"] = "truncated"
+
+            enriched += 1
+
+        if enriched:
+            logger.info("  Fetched diffs for %d PR(s)", enriched)
+
+    def _fetch_item_comments(self, repo: str, item_number: int,
+                             is_pr: bool = False) -> List[Dict]:
+        comments: List[Dict] = []
+
+        url = f"https://api.github.com/repos/{repo}/issues/{item_number}/comments"
+        data = self.github_request(url, {"per_page": 100})
+        if data and isinstance(data, list):
+            comments.extend(data)
+
+        if is_pr:
+            url = f"https://api.github.com/repos/{repo}/pulls/{item_number}/comments"
+            data = self.github_request(url, {"per_page": 100})
+            if data and isinstance(data, list):
+                comments.extend(data)
+
+        comments.sort(key=lambda c: c.get("created_at", ""), reverse=True)
+        return comments[:self.max_comments_per_item]
+
+    @staticmethod
+    def _format_comment(comment: Dict, max_body_len: int = 300) -> Dict:
+        body = (comment.get("body") or "")
+        if len(body) > max_body_len:
+            body = body[:max_body_len] + "..."
+        return {
+            "user": comment.get("user", {}).get("login", "unknown"),
+            "created_at": comment.get("created_at", ""),
+            "body": body,
+        }
+
+    def enrich_with_comments(self, repo: str, items: List[Dict],
+                             is_pr: bool = False) -> None:
+        if not self.fetch_comments:
+            return
+
+        enriched = 0
+        for item in items:
+            item_number = item.get("number")
+            if not item_number:
+                continue
+
+            raw_comments = self._fetch_item_comments(repo, item_number, is_pr=is_pr)
+            if raw_comments:
+                item["_herald_comments"] = [
+                    self._format_comment(c) for c in raw_comments
+                ]
+                enriched += 1
+
+        label = "PR" if is_pr else "issue"
+        if enriched:
+            logger.info("  Fetched comments for %d %s(s)", enriched, label)
+
+    def _clone_or_pull_repo(self, repo: str) -> Optional[Path]:
+        repo_dir = self.deep_clone_dir / repo.replace("/", "_")
+        github_token = os.environ.get("GITHUB_TOKEN")
+
+        if github_token:
+            clone_url = f"https://x-access-token:{github_token}@github.com/{repo}.git"
+        else:
+            clone_url = f"https://github.com/{repo}.git"
+
+        try:
+            if repo_dir.exists() and (repo_dir / ".git").exists():
+                result = subprocess.run(
+                    ["git", "-C", str(repo_dir), "pull", "--ff-only", "--depth=1"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode != 0:
+                    logger.debug("git pull failed for %s, trying fresh clone: %s",
+                                 repo, result.stderr.strip())
+                    shutil.rmtree(repo_dir, ignore_errors=True)
+                    return self._clone_or_pull_repo(repo)
+                logger.debug("Pulled latest for %s", repo)
+                return repo_dir
+
+            self.deep_clone_dir.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(
+                ["git", "clone", "--depth=1", "--single-branch", clone_url, str(repo_dir)],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                logger.warning("Failed to clone %s: %s", repo, result.stderr.strip())
+                return None
+            logger.info("  Cloned %s for deep analysis", repo)
+            return repo_dir
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout cloning/pulling %s", repo)
+            return None
+        except Exception as e:
+            logger.warning("Error cloning/pulling %s: %s", repo, e)
+            return None
+
+    def _read_context_files(self, repo_dir: Path) -> Dict[str, str]:
+        context: Dict[str, str] = {}
+
+        for rel_path in self.deep_context_files:
+            file_path = repo_dir / rel_path
+            if not file_path.is_file():
+                continue
+            try:
+                size = file_path.stat().st_size
+                if size > self.deep_max_file_size:
+                    logger.debug("Skipping %s (%.1f KB > %.1f KB limit)",
+                                 rel_path, size / 1024, self.deep_max_file_size / 1024)
+                    continue
+                content = file_path.read_text(encoding="utf-8", errors="replace")
+                context[rel_path] = content
+                logger.debug("Read context file %s (%d bytes)", rel_path, len(content))
+            except Exception as e:
+                logger.debug("Failed to read %s: %s", rel_path, e)
+
+        return context
+
+    def _fetch_repo_context(self, repo: str) -> Optional[Dict[str, str]]:
+        repo_dir = self._clone_or_pull_repo(repo)
+        if not repo_dir:
+            return None
+
+        context = self._read_context_files(repo_dir)
+        if context:
+            logger.info("  Read %d context file(s) for deep analysis", len(context))
+        return context if context else None
 
     # -- main fetch_activity implementation --
 
@@ -291,7 +623,7 @@ class GitHubSource(ActivitySource):
         """Fetch activity for all configured repositories."""
         results = []
         for repo in self.repositories:
-            print(f"\nFetching activity for {repo}...")
+            logger.info("Fetching activity for %s...", repo)
 
             activity: Dict[str, Any] = {
                 "repository": repo,
@@ -301,19 +633,35 @@ class GitHubSource(ActivitySource):
 
             if "commits" in self.activity_types:
                 activity["commits"] = self.fetch_commits(repo, since)
-                print(f"  Found {len(activity['commits'])} commits")
+                logger.info("  Found %d commits", len(activity['commits']))
 
             if "pulls" in self.activity_types:
                 activity["pulls"] = self.fetch_pulls(repo, since)
-                print(f"  Found {len(activity['pulls'])} pull requests")
+                logger.info("  Found %d pull requests", len(activity['pulls']))
 
             if "issues" in self.activity_types:
                 activity["issues"] = self.fetch_issues(repo, since)
-                print(f"  Found {len(activity['issues'])} issues")
+                logger.info("  Found %d issues", len(activity['issues']))
 
             if "releases" in self.activity_types:
                 activity["releases"] = self.fetch_releases(repo, since)
-                print(f"  Found {len(activity['releases'])} releases")
+                logger.info("  Found %d releases", len(activity['releases']))
+
+            activity = self.apply_filters(activity)
+
+            if "pulls" in activity and self._diff_keywords_lower:
+                self.enrich_prs_with_diffs(repo, activity["pulls"])
+
+            if self.fetch_comments:
+                if "pulls" in activity:
+                    self.enrich_with_comments(repo, activity["pulls"], is_pr=True)
+                if "issues" in activity:
+                    self.enrich_with_comments(repo, activity["issues"], is_pr=False)
+
+            if self.deep_analysis_enabled:
+                repo_context = self._fetch_repo_context(repo)
+                if repo_context:
+                    activity["_herald_repo_context"] = repo_context
 
             results.append(activity)
 
@@ -477,9 +825,24 @@ class Herald:
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_ttl = 3600
         self.config_dir = Path(__file__).parent  # default, overridden by load_config
+
+        herald_logger = logging.getLogger("herald")
+        if not any(isinstance(h, logging.FileHandler) for h in herald_logger.handlers):
+            try:
+                file_handler = logging.FileHandler(self.cache_dir / "herald.log")
+                file_handler.setFormatter(
+                    logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+                )
+                herald_logger.addHandler(file_handler)
+            except Exception as e:
+                logger.warning("Could not create log file handler: %s", e)
+
         self.config = self.load_config(config_path)
-        self.groups = self.resolve_groups()
+        self._apply_env_overrides()
+        self.teams = self.resolve_teams()
+        self._apply_env_webhook(self.teams)
         self.all_summaries_failed = False
+        self._prune_cache()
 
         # Initialize AI backend
         defaults = self.config.get("defaults", {})
@@ -487,36 +850,33 @@ class Herald:
         backend_type = ai_config.get("type", "claude-cli")
         backend_cls = AI_BACKEND_REGISTRY.get(backend_type)
         if not backend_cls:
-            print(f"Warning: Unknown AI backend '{backend_type}', falling back to claude-cli")
+            logger.warning("Unknown AI backend '%s', falling back to claude-cli",
+                           backend_type)
             backend_cls = ClaudeCLIBackend
         self.ai_backend = backend_cls(ai_config, self.cache_dir, force_refresh)
 
     def load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
         """Load configuration from file or use defaults."""
-        default_config: Dict[str, Any] = {
-            "defaults": {
-                "time_window_days": 14,
-                "max_commits": 20,
-                "activity_types": ["commits", "pulls", "issues", "releases"]
-            },
-            "groups": []
-        }
+        default_config: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
 
         if config_path is None:
-            # Search for config files; prefer herald.config.json, fall back to occ-digest
-            for path in ["./herald.config.json",
-                         Path.home() / ".herald.config.json"]:
-                if Path(path).exists():
-                    config_path = str(path)
-                    break
+            env_config = os.environ.get("HERALD_CONFIG")
+            if env_config:
+                config_path = env_config
+            else:
+                for path in CONFIG_SEARCH_PATHS:
+                    if Path(path).exists():
+                        config_path = str(path)
+                        break
 
             if config_path is None:
                 for path in ["./occ-digest.config.json",
                              Path.home() / ".occ-digest.config.json"]:
                     if Path(path).exists():
                         config_path = str(path)
-                        print(f"Warning: Using legacy config {path}. "
-                              f"Consider renaming to herald.config.json")
+                        logger.warning("Using legacy config %s. "
+                                       "Consider renaming to config/herald.json",
+                                       path)
                         break
 
         if config_path and Path(config_path).exists():
@@ -525,41 +885,161 @@ class Herald:
                 with open(config_path, 'r') as f:
                     user_config = json.load(f)
                     default_config.update(user_config)
-                    print(f"Loaded config from: {config_path}")
+                    logger.info("Config: %s", config_path)
             except Exception as e:
-                print(f"Warning: Failed to load config from {config_path}: {e}")
+                logger.warning("Failed to load config from %s: %s", config_path, e)
+        elif config_path:
+            logger.error("Config file not found: %s", config_path)
+            sys.exit(1)
+        else:
+            logger.warning("No config file found. Using defaults. "
+                           "Create config/herald.json or use --repos to get started. "
+                           "See config/herald.example.json for reference.")
 
         return default_config
 
-    def resolve_groups(self) -> List[Dict[str, Any]]:
-        """Parse groups from config. Wraps flat config as single group for backward compat."""
+    @staticmethod
+    def _parse_env_int(var_name: str, config_key: str, target: Dict[str, Any]):
+        value = os.environ.get(var_name)
+        if value:
+            try:
+                target[config_key] = int(value)
+                logger.info("%s=%s overrides %s", var_name, value, config_key)
+            except ValueError:
+                logger.warning("%s=%s is not a valid integer, ignoring", var_name, value)
+
+    def _apply_env_overrides(self):
+        defaults = self.config.setdefault("defaults", {})
+        self._parse_env_int("HERALD_DAYS", "time_window_days", defaults)
+        self._parse_env_int("HERALD_MAX_COMMITS", "max_commits", defaults)
+
+        webhook = os.environ.get("HERALD_TEAMS_WEBHOOK")
+        if webhook:
+            self.config["_env_teams_webhook"] = webhook
+            logger.info("HERALD_TEAMS_WEBHOOK set via environment")
+
+    def _apply_env_webhook(self, teams: List[Dict[str, Any]]):
+        webhook = self.config.get("_env_teams_webhook")
+        if not webhook:
+            return
+        for team in teams:
+            if not team.get("teams_webhook_url"):
+                team["teams_webhook_url"] = webhook
+
+    def _prune_cache(self, max_age_days: int = 7):
+        """Remove cache files older than max_age_days. Skips herald.log."""
+        cutoff = datetime.now().timestamp() - (max_age_days * 86400)
+        pruned = 0
+        try:
+            for f in self.cache_dir.iterdir():
+                if f.name == "herald.log" or f.is_dir():
+                    continue
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    pruned += 1
+            if pruned:
+                logger.debug("Pruned %d stale cache files (older than %d days)",
+                             pruned, max_age_days)
+        except Exception as e:
+            logger.debug("Cache pruning failed: %s", e)
+
+    def _load_team_secrets(self, team: Dict[str, Any]):
+        """Load secrets from config/secrets/<team-name>.json and merge into the team dict."""
+        team_name = team.get("name")
+        if not team_name:
+            return
+
+        secrets_path = self.config_dir / "secrets" / f"{team_name}.json"
+        if not secrets_path.exists():
+            return
+
+        try:
+            with open(secrets_path, 'r') as f:
+                secrets = json.load(f)
+        except Exception as e:
+            logger.warning("Failed to load secrets from %s: %s", secrets_path, e)
+            return
+
+        for field in SECRET_FIELD_NAMES:
+            if field in secrets and secrets[field]:
+                team[field] = secrets[field]
+
+    def _collect_sub_team_sources(self, team: Dict[str, Any],
+                                    all_teams_map: Dict[str, Dict[str, Any]],
+                                    visited: set) -> List[Dict[str, Any]]:
+        team_name = team.get("name", "unnamed")
+        if team_name in visited:
+            logger.warning("Circular sub-team reference: %s (chain: %s)",
+                           team_name, ' -> '.join(visited))
+            return []
+        visited.add(team_name)
+        all_sources = list(team.get("sources", []))
+        for sub_name in team.get("sub_teams", []):
+            sub_team = all_teams_map.get(sub_name)
+            if not sub_team:
+                logger.warning("Sub-team '%s' referenced by '%s' not found",
+                               sub_name, team_name)
+                continue
+            sub_sources = self._collect_sub_team_sources(
+                sub_team, all_teams_map, set(visited))
+            all_sources.extend(sub_sources)
+        return all_sources
+
+    def _resolve_sub_teams_all(self, teams: List[Dict[str, Any]]):
+        teams_map = {t.get("name", ""): t for t in teams if t.get("name")}
+        for team in teams:
+            if not team.get("sub_teams"):
+                continue
+            merged_sources = self._collect_sub_team_sources(team, teams_map, set())
+            seen_repos: set = set()
+            deduped_sources: List[Dict[str, Any]] = []
+            for src in merged_sources:
+                new_repos = [r for r in src.get("repositories", []) if r not in seen_repos]
+                if new_repos:
+                    seen_repos.update(new_repos)
+                    deduped_src = dict(src)
+                    deduped_src["repositories"] = new_repos
+                    deduped_sources.append(deduped_src)
+            team["sources"] = deduped_sources
+
+    def resolve_teams(self) -> List[Dict[str, Any]]:
+        """Parse teams from config. Wraps flat config as single team for backward compat."""
         config = self.config
 
-        # New-style: groups array present
-        if "groups" in config and config["groups"]:
+        teams_key = "teams" if "teams" in config else "groups"
+        if teams_key in config and config[teams_key]:
+            if teams_key == "groups":
+                logger.warning("Config uses deprecated 'groups' key. "
+                               "Rename to 'teams' in your config file.")
             resolved = []
-            for group in config["groups"]:
-                # Support external config files
-                if "config_file" in group:
-                    ext_path = self.config_dir / group["config_file"]
+            for team_entry in config[teams_key]:
+                if "config_file" in team_entry:
+                    ext_path = self.config_dir / team_entry["config_file"]
                     if ext_path.exists():
                         try:
                             with open(ext_path, 'r') as f:
                                 ext_config = json.load(f)
-                            # Merge: external config overrides, but keep group name
-                            name = group.get("name", ext_path.stem)
+                            name = team_entry.get("name", ext_path.stem)
                             ext_config["name"] = name
                             resolved.append(ext_config)
                             continue
                         except Exception as e:
-                            print(f"Warning: Failed to load external config {ext_path}: {e}")
-                resolved.append(group)
+                            logger.warning("Failed to load external config %s: %s",
+                                           ext_path, e)
+                    else:
+                        team_name = team_entry.get("name", team_entry["config_file"])
+                        logger.warning("External config file not found: %s "
+                                       "(team '%s' will have no sources)",
+                                       ext_path, team_name)
+                resolved.append(team_entry)
+            for team in resolved:
+                self._load_team_secrets(team)
+            self._resolve_sub_teams_all(resolved)
             return resolved
 
-        # Legacy flat config: repositories at top level
         if "repositories" in config:
             defaults = config.get("defaults", {})
-            group = {
+            team = {
                 "name": "default",
                 "sources": [
                     {
@@ -577,35 +1057,120 @@ class Herald:
             }
             webhook = config.get("teams_webhook_url")
             if webhook:
-                group["teams_webhook_url"] = webhook
-            return [group]
+                team["teams_webhook_url"] = webhook
+            return [team]
 
         return []
 
     def get_defaults(self) -> Dict[str, Any]:
         """Return merged defaults."""
-        return self.config.get("defaults", {
-            "time_window_days": 14,
-            "max_commits": 20,
-            "activity_types": ["commits", "pulls", "issues", "releases"]
-        })
+        return self.config.get("defaults", DEFAULT_CONFIG["defaults"])
 
-    def list_groups(self):
-        """Print configured groups and exit."""
-        if not self.groups:
-            print("No groups configured.")
+    @staticmethod
+    def _resolve_team_context(team: Dict[str, Any]) -> Dict[str, Any]:
+        legacy = team.get("team_context", {})
+        return {
+            "name": team.get("display_name") or legacy.get("name", ""),
+            "focus_areas": team.get("focus_areas") or legacy.get("focus_areas", []),
+            "priorities": team.get("priorities") or legacy.get("priorities", []),
+        }
+
+    def validate(self) -> bool:
+        """Validate configuration without making API calls."""
+        valid = True
+        issues = 0
+
+        if not self.teams:
+            print("FAIL: No teams configured.")
+            valid = False
+        else:
+            print(f"OK: {len(self.teams)} team(s) configured")
+
+        for team in self.teams:
+            name = team.get("name", "unnamed")
+            sources = team.get("sources", [])
+            if not sources:
+                print(f"WARN: Team '{name}' has no sources")
+                issues += 1
+
+            for src in sources:
+                repos = src.get("repositories", [])
+                if not repos:
+                    print(f"WARN: Source in team '{name}' has no repositories")
+                    issues += 1
+                for repo in repos:
+                    parts = repo.split('/')
+                    if len(parts) != 2 or not all(parts):
+                        print(f"FAIL: Invalid repository format: {repo} (expected owner/repo)")
+                        valid = False
+
+            tc = self._resolve_team_context(team)
+            if not tc.get("name"):
+                print(f"WARN: Team '{name}' has no display_name (AI summaries will be generic)")
+                issues += 1
+
+        all_team_names = {t.get("name", "") for t in self.teams}
+        for team in self.teams:
+            name = team.get("name", "unnamed")
+            for sub in team.get("sub_teams", []):
+                if sub not in all_team_names:
+                    print(f"WARN: Team '{name}' references sub-team '{sub}' which does not exist")
+                    issues += 1
+                elif sub == name:
+                    print(f"WARN: Team '{name}' references itself as sub-team")
+                    issues += 1
+
+        secrets_dir = self.config_dir / "secrets"
+        if secrets_dir.is_dir():
+            secret_files = list(secrets_dir.glob("*.json"))
+            non_example = [f for f in secret_files if not f.name.endswith(".example.json")]
+            if non_example:
+                names = ", ".join(f.stem for f in non_example)
+                print(f"OK: secrets/ directory found with files for: {names}")
+            else:
+                print("OK: secrets/ directory exists (no team secret files yet)")
+        else:
+            print("WARN: secrets/ directory not found. Create it to store webhook URLs.")
+            issues += 1
+
+        if self.ai_backend.validate():
+            print(f"OK: AI backend ({self.ai_backend.backend_type}) is available")
+        else:
+            print(f"WARN: AI backend ({self.ai_backend.backend_type}) not found. "
+                  f"Summaries will fall back to raw data.")
+            issues += 1
+
+        if os.environ.get('GITHUB_TOKEN'):
+            print("OK: GITHUB_TOKEN is set (5000 requests/hour)")
+        else:
+            print("WARN: GITHUB_TOKEN not set (limited to 60 requests/hour)")
+            issues += 1
+
+        if valid and issues == 0:
+            print("\nAll checks passed.")
+        elif valid:
+            print(f"\nPassed with {issues} warning(s).")
+        else:
+            print("\nValidation failed.")
+
+        return valid
+
+    def list_teams(self):
+        """Print configured teams and exit."""
+        if not self.teams:
+            print("No teams configured.")
             return
-        print("Configured groups:")
-        for group in self.groups:
-            name = group.get("name", "unnamed")
-            sources = group.get("sources", [])
+        print("Configured teams:")
+        for team in self.teams:
+            name = team.get("name", "unnamed")
+            sources = team.get("sources", [])
             source_summary = []
             for src in sources:
                 src_type = src.get("type", "unknown")
                 repos = src.get("repositories", [])
                 source_summary.append(f"{src_type}: {', '.join(repos)}")
-            team = group.get("team_context", {}).get("name", "")
-            team_str = f" (team: {team})" if team else ""
+            display = self._resolve_team_context(team).get("name", "")
+            team_str = f" (display: {display})" if display else ""
             print(f"  - {name}{team_str}")
             for s in source_summary:
                 print(f"      {s}")
@@ -690,7 +1255,7 @@ class Herald:
             pulls = activity.get("pulls", [])
             prompt += f"PULL REQUESTS ({len(pulls)}):\n"
             for pr in pulls[:30]:
-                state = "merged" if pr.get('merged_at') else pr['state']
+                state = _get_pr_state(pr)
                 body = (pr.get('body') or '')[:200].replace('\n', ' ')
                 prompt += (f"- #{pr['number']}: {pr['title']} [{state}] "
                            f"by {pr['user']['login']} - {pr['html_url']}\n")
@@ -778,26 +1343,26 @@ Start directly with "### Summary"."""
 
         return prompt
 
-    def get_summary_cache_path(self, group_name: str) -> Path:
-        safe_name = group_name.replace('/', '_').replace(' ', '_')
+    def get_summary_cache_path(self, team_name: str) -> Path:
+        safe_name = team_name.replace('/', '_').replace(' ', '_')
         date_str = datetime.now().strftime('%Y-%m-%d')
         return self.cache_dir / f"{safe_name}_summary_{date_str}.txt"
 
     def generate_summary(self, activity_list: List[Dict[str, Any]],
                           team_context: Dict[str, Any],
-                          group_name: str) -> str:
+                          team_name: str) -> str:
         """Generate AI summary using the configured backend."""
-        summary_cache = self.get_summary_cache_path(group_name)
+        summary_cache = self.get_summary_cache_path(team_name)
         if not self.force_refresh and self.is_cache_valid(summary_cache):
             cached = self.load_cache_text(summary_cache)
             if cached:
-                print(f"\n  Using cached summary for {group_name}")
+                print(f"\n  Using cached summary for {team_name}")
                 return cached
 
-        print(f"\n  Generating AI summary for {group_name}...")
+        print(f"\n  Generating AI summary for {team_name}...")
 
         prompt = self.format_prompt(activity_list, team_context)
-        summary = self.ai_backend.summarize(prompt, group_name)
+        summary = self.ai_backend.summarize(prompt, team_name)
 
         if summary:
             summary = self.strip_conversational_output(summary)
@@ -830,10 +1395,10 @@ Start directly with "### Summary"."""
 
     # -- report generation --
 
-    def save_detailed_report(self, group_name: str, activity_list: List[Dict[str, Any]],
+    def save_detailed_report(self, team_name: str, activity_list: List[Dict[str, Any]],
                               time_window_days: int):
-        """Save detailed raw activity data to reports/<group_name>/."""
-        safe_name = group_name.replace(' ', '-').lower()
+        """Save detailed raw activity data to reports/<team_name>/."""
+        safe_name = team_name.replace(' ', '-').lower()
         output_dir = Path(__file__).parent / "reports" / safe_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -841,7 +1406,7 @@ Start directly with "### Summary"."""
         output_file = output_dir / f"herald-detailed-{timestamp}.md"
 
         output = "# Herald Activity Detailed Report\n"
-        output += f"Group: {group_name}\n"
+        output += f"Team: {team_name}\n"
         output += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         output += f"Time Period: Last {time_window_days} days\n\n"
 
@@ -865,7 +1430,7 @@ Start directly with "### Summary"."""
 
             output += f"\n### Pull Requests ({len(pulls)})\n"
             for pr in pulls:
-                state = "merged" if pr.get('merged_at') else pr['state']
+                state = _get_pr_state(pr)
                 body = (pr.get('body') or '')[:300]
                 output += f"- #{pr['number']}: {pr['title']} [{state}] by {pr['user']['login']}\n"
                 output += f"  {pr['html_url']}\n"
@@ -920,7 +1485,7 @@ Start directly with "### Summary"."""
 
             output += f"\n### Pull Requests ({len(pulls)})\n"
             for pr in pulls[:10]:
-                state = "merged" if pr.get('merged_at') else pr['state']
+                state = _get_pr_state(pr)
                 output += f"- #{pr['number']}: {pr['title']} [{state}] - {pr['html_url']}\n"
 
             output += f"\n### Issues ({len(issues)})\n"
@@ -1041,24 +1606,23 @@ Start directly with "### Summary"."""
             print(f"Error posting to Teams: {e}")
             return False
 
-    # -- group digest generation --
+    # -- team digest generation --
 
-    def generate_group_digest(self, group: Dict[str, Any],
+    def generate_team_digest(self, team: Dict[str, Any],
                                time_window_days: Optional[int] = None) -> Tuple[str, bool]:
-        """Process one group end-to-end: fetch activity, generate summary, save report."""
-        group_name = group.get("name", "unnamed")
-        team_context = group.get("team_context", {})
+        """Process one team end-to-end: fetch activity, generate summary, save report."""
+        team_name = team.get("name", "unnamed")
+        team_context = self._resolve_team_context(team)
         defaults = self.get_defaults()
 
         if time_window_days is None:
-            time_window_days = group.get("time_window_days",
+            time_window_days = team.get("time_window_days",
                                           defaults.get("time_window_days", 14))
 
         since = datetime.now(timezone.utc) - timedelta(days=time_window_days)
 
-        # Create sources and fetch activity
         all_activity: List[Dict[str, Any]] = []
-        sources_config = group.get("sources", [])
+        sources_config = team.get("sources", [])
 
         for src_config in sources_config:
             src_type = src_config.get("type", "github")
@@ -1067,31 +1631,27 @@ Start directly with "### Summary"."""
                 print(f"Warning: Unknown source type '{src_type}', skipping")
                 continue
 
-            # Merge defaults into source config
             merged_config = {**defaults, **src_config}
             source = source_cls(merged_config, self.cache_dir, self.force_refresh)
 
             if not source.validate():
-                print(f"Error: Source validation failed for {src_type} in group {group_name}")
+                print(f"Error: Source validation failed for {src_type} in team {team_name}")
                 continue
 
             activity = source.fetch_activity(since)
             all_activity.extend(activity)
 
         if not all_activity:
-            return f"No activity found for group {group_name}.\n", True
+            return f"No activity found for team {team_name}.\n", True
 
-        # Save detailed report
-        self.save_detailed_report(group_name, all_activity, time_window_days)
+        self.save_detailed_report(team_name, all_activity, time_window_days)
 
-        # Build output
         short_date = datetime.now().strftime('%b %d, %Y')
         repo_names = ", ".join(a["repository"].split('/')[-1] for a in all_activity)
         output = f"# {repo_names} Digest - {short_date}\n"
-        output += f"*Group: {group_name}*\n\n"
+        output += f"*Team: {team_name}*\n\n"
 
-        # Generate AI summary across all repos in this group
-        summary = self.generate_summary(all_activity, team_context, group_name)
+        summary = self.generate_summary(all_activity, team_context, team_name)
         summary_failed = (not summary or summary.startswith(RAW_ACTIVITY_HEADER))
 
         if not summary_failed:
@@ -1126,15 +1686,14 @@ Start directly with "### Summary"."""
 
         return output, summary_failed
 
-    def generate_digest(self, group_names: Optional[List[str]] = None,
+    def generate_digest(self, team_names: Optional[List[str]] = None,
                          repositories: Optional[List[str]] = None,
                          time_window_days: Optional[int] = None) -> str:
-        """Generate digest across groups. Returns combined markdown output."""
+        """Generate digest across teams. Returns combined markdown output."""
         all_summaries_failed = True
 
-        # If --repos is used, create a temporary single group
         if repositories:
-            temp_group = {
+            temp_team = {
                 "name": "cli-repos",
                 "sources": [
                     {
@@ -1144,22 +1703,22 @@ Start directly with "### Summary"."""
                 ],
                 "team_context": {},
             }
-            groups_to_process = [temp_group]
-        elif group_names:
-            groups_to_process = [g for g in self.groups if g.get("name") in group_names]
-            missing = set(group_names) - {g.get("name") for g in groups_to_process}
+            teams_to_process = [temp_team]
+        elif team_names:
+            teams_to_process = [t for t in self.teams if t.get("name") in team_names]
+            missing = set(team_names) - {t.get("name") for t in teams_to_process}
             if missing:
-                print(f"Warning: Groups not found: {', '.join(missing)}")
+                print(f"Warning: Teams not found: {', '.join(missing)}")
         else:
-            groups_to_process = self.groups
+            teams_to_process = self.teams
 
-        if not groups_to_process:
-            print("Error: No groups to process.")
+        if not teams_to_process:
+            print("Error: No teams to process.")
             sys.exit(1)
 
         combined_output = ""
-        for group in groups_to_process:
-            result = self.generate_group_digest(group, time_window_days)
+        for team in teams_to_process:
+            result = self.generate_team_digest(team, time_window_days)
             if isinstance(result, tuple):
                 output, summary_failed = result
                 if not summary_failed:
@@ -1173,6 +1732,93 @@ Start directly with "### Summary"."""
             print("\nWarning: All Claude summaries failed. Check Claude CLI setup.")
 
         return combined_output
+
+
+# ---------------------------------------------------------------------------
+# Config migration
+# ---------------------------------------------------------------------------
+
+def _migrate_config_layout():
+    """Detect old directory layout and migrate to config/ structure.
+
+    Old layout:
+        herald.config.json, groups/, secrets/
+    New layout:
+        config/herald.json, config/teams/, config/secrets/, config/backups/
+    """
+    cwd = Path.cwd()
+    old_config = cwd / "herald.config.json"
+    old_groups = cwd / "groups"
+    old_secrets = cwd / "secrets"
+    new_config_dir = cwd / "config"
+
+    if new_config_dir.exists() and (new_config_dir / "herald.json").exists():
+        if old_config.exists():
+            print("Warning: Both config/herald.json and herald.config.json exist. "
+                  "Using config/herald.json. Remove the old file to silence this warning.")
+        return
+
+    if not old_config.exists():
+        return
+
+    print("Migrating to new config/ directory layout...")
+
+    new_teams_dir = new_config_dir / "teams"
+    new_secrets_dir = new_config_dir / "secrets"
+    new_backups_dir = new_config_dir / "backups"
+    for d in [new_config_dir, new_teams_dir, new_secrets_dir, new_backups_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with open(old_config, 'r') as f:
+            config_data = json.load(f)
+    except Exception as e:
+        print(f"Error: Failed to read {old_config} during migration: {e}")
+        return
+
+    if "groups" in config_data:
+        config_data["teams"] = config_data.pop("groups")
+
+    for team in config_data.get("teams", []):
+        cf = team.get("config_file", "")
+        if cf.startswith("groups/"):
+            team["config_file"] = "teams/" + cf[len("groups/"):]
+
+    new_config_path = new_config_dir / "herald.json"
+    with open(new_config_path, 'w') as f:
+        json.dump(config_data, f, indent=2)
+        f.write("\n")
+    print("  herald.config.json -> config/herald.json")
+
+    if old_groups.is_dir():
+        for src_file in sorted(old_groups.glob("*.json")):
+            if ".backup." in src_file.name:
+                dst = new_backups_dir / src_file.name
+                shutil.move(str(src_file), str(dst))
+                print(f"  groups/{src_file.name} -> config/backups/{src_file.name}")
+            else:
+                dst = new_teams_dir / src_file.name
+                shutil.move(str(src_file), str(dst))
+                print(f"  groups/{src_file.name} -> config/teams/{src_file.name}")
+        try:
+            old_groups.rmdir()
+        except OSError:
+            pass
+
+    if old_secrets.is_dir():
+        for src_file in sorted(old_secrets.glob("*.json")):
+            dst = new_secrets_dir / src_file.name
+            shutil.move(str(src_file), str(dst))
+            print(f"  secrets/{src_file.name} -> config/secrets/{src_file.name}")
+        try:
+            old_secrets.rmdir()
+        except OSError:
+            pass
+
+    backup_name = f"herald.config.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    shutil.move(str(old_config), str(new_backups_dir / backup_name))
+    print(f"  Old herald.config.json backed up to config/backups/{backup_name}")
+    print("Migration complete. Config is now in config/")
 
 
 # ---------------------------------------------------------------------------
@@ -1190,7 +1836,7 @@ def main():
     )
     parser.add_argument(
         '--repos',
-        help='Comma-separated list of repositories (owner/repo). Overrides configured groups.'
+        help='Comma-separated list of repositories (owner/repo). Overrides configured teams.'
     )
     parser.add_argument(
         '--days',
@@ -1212,25 +1858,62 @@ def main():
         help='Post digest to Microsoft Teams via Power Automate webhook'
     )
     parser.add_argument(
+        '--team', '-t',
+        action='append',
+        dest='team',
+        help='Run only specific team(s) by name (can be repeated)'
+    )
+    parser.add_argument(
         '--group', '-g',
         action='append',
-        help='Run only specific group(s) by name (can be repeated)'
+        dest='team',
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        '--list-teams',
+        action='store_true',
+        help='Print configured teams and exit'
     )
     parser.add_argument(
         '--list-groups',
         action='store_true',
-        help='Print configured groups and exit'
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        '--validate',
+        action='store_true',
+        help='Validate configuration and prerequisites, then exit'
+    )
+    parser.add_argument(
+        '--quiet', '-q',
+        action='store_true',
+        help='Suppress informational messages'
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable debug logging'
     )
 
     args = parser.parse_args()
 
-    # Initialize
-    herald = Herald(config_path=args.config, force_refresh=args.force)
+    setup_logging(verbose=args.verbose, quiet=args.quiet)
 
-    # List groups and exit
-    if args.list_groups:
-        herald.list_groups()
+    _migrate_config_layout()
+
+    config_path = args.config or os.environ.get("HERALD_CONFIG")
+
+    # Initialize
+    herald = Herald(config_path=config_path, force_refresh=args.force)
+
+    if args.list_teams or args.list_groups:
+        herald.list_teams()
         return
+
+    if args.validate:
+        valid = herald.validate()
+        sys.exit(0 if valid else 1)
 
     # Parse repositories
     repositories = None
@@ -1239,7 +1922,7 @@ def main():
 
     # Generate digest
     output = herald.generate_digest(
-        group_names=args.group,
+        team_names=args.team,
         repositories=repositories,
         time_window_days=args.days
     )
@@ -1248,7 +1931,7 @@ def main():
     if args.output:
         with open(args.output, 'w') as f:
             f.write(output)
-        print(f"\nSummary written to: {args.output}")
+        logger.info("Output saved: %s", args.output)
     else:
         print("\n" + "=" * 80)
         print(output)
@@ -1257,11 +1940,11 @@ def main():
     # Post to Teams if requested
     if args.teams:
         if herald.all_summaries_failed:
-            print("\nSkipping Teams post: AI summary generation failed.")
+            logger.warning("Skipping Teams post: AI summary generation failed.")
         else:
-            # Post to each group's webhook
-            for group in herald.groups:
-                webhook = group.get("teams_webhook_url")
+            # Post to each team's webhook
+            for team in herald.teams:
+                webhook = team.get("teams_webhook_url")
                 if webhook:
                     herald.post_to_teams(output, webhook)
 
