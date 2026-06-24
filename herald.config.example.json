@@ -2,11 +2,7 @@
   "defaults": {
     "time_window_days": 14,
     "max_commits": 20,
-    "activity_types": ["commits", "pulls", "issues", "releases"],
-    "ai_backend": {
-      "type": "claude-cli",
-      "timeout": 600
-    }
+    "activity_types": ["commits", "pulls", "issues", "releases"]
   },
   "teams": [
     {
