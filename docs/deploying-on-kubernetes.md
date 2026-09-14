@@ -105,6 +105,105 @@ A healthy run logs each repo fetch, `Rated N PRs`, `Digest saved`, and — with
 kubectl delete job herald-manual -n herald
 ```
 
+## Scheduling
+
+The CronJob's `cronjob.schedule` is a standard 5-field cron expression:
+
+```
+┌─ minute (0-59)
+│ ┌─ hour (0-23)
+│ │ ┌─ day of month (1-31)
+│ │ │ ┌─ month (1-12)
+│ │ │ │ ┌─ day of week (0-6, Sun=0)
+0 9 * * 1     # every Monday at 09:00
+```
+
+| When | Cron |
+|------|------|
+| Monday 09:00 | `0 9 * * 1` |
+| Weekdays 08:30 | `30 8 * * 1-5` |
+| Daily 07:00 | `0 7 * * *` |
+| Mondays & Thursdays 09:00 | `0 9 * * 1,4` |
+| Every 6 hours | `0 */6 * * *` |
+
+### Timezone
+
+Kubernetes CronJobs run in **UTC** unless you set a timezone. Use
+`cronjob.timeZone` with an IANA zone name so the schedule reflects local
+wall-clock time — a named zone also tracks daylight-saving transitions
+automatically:
+
+```yaml
+cronjob:
+  schedule: "0 8 * * 1"      # 08:00...
+  timeZone: "America/Chicago"  # ...Central time, DST-aware
+```
+
+Changing the schedule is a `helm upgrade` — Kubernetes patches the live CronJob
+in place; existing/running Jobs are unaffected.
+
+## Multiple teams
+
+Herald resolves the Teams webhook **per team** at post time, from
+`config/secrets/<team>.json` (mounted from the Secret). `--team` is repeatable,
+and omitting it digests every configured team. So a single command already fans
+out to each team's own channel:
+
+```bash
+herald.py digest --team team-a --team team-b --post   # each posts to its own webhook
+```
+
+There are two ways to shape this on the cluster.
+
+### Model A — one CronJob, all teams, one schedule
+
+Point `cronjob.args` at several teams (or omit `--team` for all) and mount every
+webhook. The Secret holds all the webhook files; `webhookTeams` lists them:
+
+```bash
+helm upgrade --install herald ./helm/herald -n herald \
+  -f helm/herald/values.local.yaml \
+  --set secrets.existingSecret=herald-secrets \
+  --set 'secrets.webhookTeams={team-a,team-b,team-c}'
+# with cronjob.args: [digest, --team, team-a, --team, team-b, --team, team-c, --post]
+```
+
+Simplest, but all teams share one schedule and run sequentially in one pod; one
+team's failure affects the batch.
+
+### Model B — one release per team (independent schedules)
+
+Install the chart once per team as separate releases, each with its own
+`fullnameOverride`, schedule/timezone, team args, and mounted webhook. **All
+releases share one Secret** — it contains the API credentials (common to every
+team) plus every team's `<team>.json` webhook; each release mounts only its own
+via `webhookTeams`:
+
+```bash
+# Shared secret: API creds + all webhook files, created once.
+kubectl create secret generic herald-secrets -n herald \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  --from-literal=GITHUB_TOKEN="$(gh auth token)" \
+  --from-file=team-a.json=config/secrets/team-a.json \
+  --from-file=team-b.json=config/secrets/team-b.json \
+  --from-file=team-c.json=config/secrets/team-c.json
+
+# One release per team, each mounting only its own webhook.
+helm upgrade --install herald-a ./helm/herald -n herald \
+  -f helm/herald/values.team-a.yaml \
+  --set secrets.existingSecret=herald-secrets \
+  --set 'secrets.webhookTeams={team-a}'
+# ...repeat for herald-b, herald-c
+```
+
+Each overlay sets `fullnameOverride` (so the CronJob/ConfigMap names don't
+collide), its `cronjob.args`/`schedule`/`timeZone`, and its team in
+`config.teams`. This gives independent schedules, isolated failures, and
+per-team job history at the cost of managing several releases.
+
+Choose Model A when every team wants the same slot; Model B when they need
+different times or failure isolation.
+
 ## Troubleshooting
 
 ### Pod stuck `Pending` — no storage
