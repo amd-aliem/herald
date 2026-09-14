@@ -150,6 +150,10 @@ Herald ships a `python:3.12-slim` image and a Helm chart that runs `herald.py
 digest` on a schedule. `values.yaml` defaults `image.repository` to the published
 GHCR image; override it for a private registry or mirror.
 
+For a full walkthrough — secret management, one-off test runs, and common
+gotchas (storage, image pulls, endpoint DNS) — see
+[docs/deploying-on-kubernetes.md](docs/deploying-on-kubernetes.md).
+
 ```bash
 docker build -t herald:poc .    # or pull the published ghcr.io image
 
