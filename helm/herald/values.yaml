@@ -41,6 +41,10 @@ secrets:
   teamWebhooks: {}
 cronjob:
   schedule: 0 9 * * 1
+  # IANA timezone for the schedule (e.g. America/Los_Angeles, Europe/Berlin).
+  # Empty = UTC. Uses the CronJob .spec.timeZone field (Kubernetes >= 1.27);
+  # a named zone also tracks DST automatically.
+  timeZone: ''
   args:
   - digest
   - --team
