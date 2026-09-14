@@ -13,8 +13,10 @@
 # and manage the Secret out of band.
 
 image:
-  repository: herald
-  tag: poc
+  # Published by .github/workflows/publish-image.yml on version tags.
+  # Override for a private registry or mirror.
+  repository: ghcr.io/amd-aliem/herald
+  tag: latest
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 nameOverride: ''

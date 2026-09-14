@@ -124,13 +124,34 @@ model id, and any custom auth header.
 The `digest` command ports the `herald-rate-pr` and `herald-analyze` skill
 prompts into Python, so headless and interactive runs produce comparable output.
 
+## Publishing the image
+
+The `.github/workflows/publish-image.yml` workflow builds the image and pushes it
+to the GitHub Container Registry on version tags — no extra secrets needed (it
+uses the built-in `GITHUB_TOKEN`):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# -> ghcr.io/<owner>/herald:0.1.0, :0.1, :sha-<commit>, :latest
+```
+
+Make the package **public** (repo → Packages → package settings) so clusters can
+pull without an image pull secret. To publish elsewhere, build and push manually:
+
+```bash
+docker build -t <registry>/herald:<tag> .
+docker push <registry>/herald:<tag>
+```
+
 ## Container & Kubernetes
 
 Herald ships a `python:3.12-slim` image and a Helm chart that runs `herald.py
-digest` on a schedule.
+digest` on a schedule. `values.yaml` defaults `image.repository` to the published
+GHCR image; override it for a private registry or mirror.
 
 ```bash
-docker build -t herald:poc .
+docker build -t herald:poc .    # or pull the published ghcr.io image
 
 helm install herald ./helm/herald \
   --set secrets.anthropicApiKey=$ANTHROPIC_API_KEY \
