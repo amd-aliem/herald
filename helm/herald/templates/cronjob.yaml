@@ -69,7 +69,7 @@ spec:
                   mountPath: /app/config/herald.json
                   subPath: herald.json
                   readOnly: true
-                {{- if .Values.secrets.teamWebhooks }}
+                {{- if (include "herald.webhookTeams" . | fromJsonArray) }}
                 - name: secrets
                   mountPath: /app/config/secrets
                   readOnly: true
@@ -84,14 +84,14 @@ spec:
             - name: config
               configMap:
                 name: {{ include "herald.fullname" . }}-config
-            {{- if .Values.secrets.teamWebhooks }}
+            {{- with (include "herald.webhookTeams" . | fromJsonArray) }}
             - name: secrets
               secret:
-                secretName: {{ include "herald.secretName" . }}
+                secretName: {{ include "herald.secretName" $ }}
                 items:
-                  {{- range $team, $url := .Values.secrets.teamWebhooks }}
-                  - key: {{ $team }}.json
-                    path: {{ $team }}.json
+                  {{- range . }}
+                  - key: {{ . }}.json
+                    path: {{ . }}.json
                   {{- end }}
             {{- end }}
             - name: cache

@@ -165,6 +165,29 @@ per-team webhooks live in the **Secret**. The endpoint base URL and model are se
 under `endpoint:` in `values.yaml`. The CronJob's `cronjob.args` selects which
 team(s) to digest.
 
+### Managing the Secret out of band
+
+To keep credentials out of Helm values (recommended), create the Secret yourself
+and point the chart at it with `secrets.existingSecret`. The Secret holds the API
+credentials as keys and each team's webhook as a `<team>.json` file:
+
+```bash
+kubectl create secret generic herald-secrets -n herald \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  --from-literal=GITHUB_TOKEN="$(gh auth token)" \
+  --from-file=my-team.json=config/secrets/my-team.json
+# Behind a gateway, also:
+#   --from-literal=ANTHROPIC_CUSTOM_HEADERS="X-Auth-Header: <value>"
+
+helm install herald ./helm/herald \
+  --set secrets.existingSecret=herald-secrets \
+  --set 'secrets.webhookTeams={my-team}'   # webhook files to mount for --post
+```
+
+Because Helm can't read an existing Secret's keys, `secrets.webhookTeams` lists
+which `<team>.json` webhook files it contains so they get mounted at
+`/app/config/secrets/`. Omit it if you don't post to Teams.
+
 ## Skills (Claude Code)
 
 Skills live in `.claude/skills/` and are available automatically when working in this repo.

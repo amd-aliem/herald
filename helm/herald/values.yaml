@@ -25,11 +25,19 @@ endpoint:
   baseUrl: https://api.anthropic.com
   model: claude-opus-4-8
 secrets:
+  # Point at a pre-created Secret to manage credentials out of band (kubectl,
+  # sealed-secrets, external-secrets). When set, the chart does NOT create its
+  # own Secret and the fields below are ignored — except webhookTeams, which
+  # lists the "<team>.json" webhook files the Secret provides so they get
+  # mounted (the chart can't introspect an existing Secret's keys).
   existingSecret: ''
+  webhookTeams: []
   anthropicApiKey: ''
   # For a gateway needing custom auth headers, set as "Key: Value" (one per line).
   anthropicCustomHeaders: ''
   githubToken: ''
+  # Chart-generated Secret only: map of team -> webhook URL. Rendered into
+  # "<team>.json" keys and mounted at /app/config/secrets/.
   teamWebhooks: {}
 cronjob:
   schedule: 0 9 * * 1

@@ -56,3 +56,17 @@ The Secret name that holds API keys and webhooks (created here or referenced).
 {{- printf "%s-secrets" (include "herald.fullname" .) }}
 {{- end }}
 {{- end }}
+
+{{/*
+Team names whose "<team>.json" webhook file should be mounted from the Secret.
+When the chart generates the Secret, this is the keys of secrets.teamWebhooks.
+With an existingSecret, the chart cannot introspect it, so the caller lists the
+webhook filenames to mount via secrets.webhookTeams. Emits a JSON list of names.
+*/}}
+{{- define "herald.webhookTeams" -}}
+{{- if .Values.secrets.existingSecret -}}
+{{- .Values.secrets.webhookTeams | default list | toJson -}}
+{{- else -}}
+{{- keys (.Values.secrets.teamWebhooks | default dict) | toJson -}}
+{{- end -}}
+{{- end }}
