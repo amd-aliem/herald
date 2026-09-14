@@ -749,8 +749,8 @@ class Herald:
                         break
 
             if config_path is None:
-                for path in ["./occ-digest.config.json",
-                             Path.home() / ".occ-digest.config.json"]:
+                for path in ["./herald-legacy.config.json",
+                             Path.home() / ".herald-legacy.config.json"]:
                     if Path(path).exists():
                         config_path = str(path)
                         logger.warning("Using legacy config %s. "
@@ -1555,7 +1555,7 @@ def post_digest_to_teams(digest_output: str, webhook_url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# LLM client — direct Anthropic Messages API (AMD-internal endpoint compatible)
+# LLM client — direct Anthropic Messages API (gateway/proxy endpoint compatible)
 # ---------------------------------------------------------------------------
 
 class LLMError(Exception):

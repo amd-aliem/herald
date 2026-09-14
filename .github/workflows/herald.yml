@@ -40,7 +40,7 @@ jobs:
 
       - name: Generate digest
         env:
-          # Anthropic-compatible endpoint (api.anthropic.com or AMD-internal gateway).
+          # Anthropic-compatible endpoint (api.anthropic.com or a corporate gateway).
           ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
