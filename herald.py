@@ -1779,15 +1779,20 @@ def _parse_relevance(text: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def rate_prs(client: AnthropicClient, envelope: Dict[str, Any]) -> Tuple[int, int]:
+def rate_prs(client: AnthropicClient,
+             envelope: Dict[str, Any]) -> Tuple[int, int, int]:
     """Rate every PR with a diff that isn't already rated. Mutates envelope.
 
-    Returns (rated, skipped).
+    Returns (rated, skipped, failed) where ``failed`` counts PRs whose rating
+    call raised an infrastructure error (e.g. the LLM endpoint was unreachable),
+    as opposed to being skipped or unparseable. Callers use it to detect a
+    degraded run and avoid posting a partial digest.
     """
     meta = envelope.get("meta", {})
     team_context = meta.get("team_context", {})
     rated = 0
     skipped = 0
+    failed = 0
 
     for repo_activity in envelope.get("activity", []):
         repo = repo_activity.get("repository", "unknown")
@@ -1814,6 +1819,7 @@ def rate_prs(client: AnthropicClient, envelope: Dict[str, Any]) -> Tuple[int, in
             except LLMError as e:
                 logger.warning("  Rating PR %s#%s failed: %s",
                                repo, pr.get("number"), e)
+                failed += 1
                 continue
 
             if relevance is None:
@@ -1824,7 +1830,7 @@ def rate_prs(client: AnthropicClient, envelope: Dict[str, Any]) -> Tuple[int, in
             pr["_herald_relevance"] = relevance
             rated += 1
 
-    return rated, skipped
+    return rated, skipped, failed
 
 
 def _truncate(value: Any, limit: int) -> Any:
@@ -2251,8 +2257,9 @@ def main():
                         team_name, stats.get("repos", 0),
                         stats.get("pulls", 0), stats.get("commits", 0))
 
-            rated, skipped = rate_prs(client, envelope)
-            logger.info("  Rated %d PRs (skipped %d already-rated)", rated, skipped)
+            rated, skipped, failed = rate_prs(client, envelope)
+            logger.info("  Rated %d PRs (skipped %d already-rated, %d failed)",
+                        rated, skipped, failed)
 
             try:
                 digest_md = generate_digest(client, envelope)
@@ -2263,6 +2270,11 @@ def main():
 
             digest_md = prepend_digest_header(digest_md, envelope)
 
+            # A digest with rating failures is degraded: some PRs couldn't be
+            # scored because the LLM endpoint was unreachable. Save it for
+            # inspection, but never post a partial digest to a team channel.
+            degraded = failed > 0
+
             if args.output and len(envelopes) == 1:
                 out_path = Path(args.output)
             else:
@@ -2272,7 +2284,14 @@ def main():
             out_path.write_text(digest_md + "\n", encoding="utf-8")
             logger.info("  Digest saved to %s", out_path)
 
-            if args.post:
+            if args.post and degraded:
+                logger.error(
+                    "  Not posting '%s': %d PR rating(s) failed (LLM endpoint "
+                    "unreachable). Digest saved to %s for inspection; re-run "
+                    "once the endpoint is reachable.",
+                    team_name, failed, out_path)
+                exit_code = 1
+            elif args.post:
                 webhook = herald.resolve_webhook(team_name=team_name)
                 if not webhook:
                     logger.error("  --post requested but no webhook for '%s'", team_name)

@@ -67,6 +67,10 @@ podSecurityContext:
   runAsUser: 1000
   fsGroup: 1000
 extraEnv: []
+# Static /etc/hosts entries for the pod. Use when the LLM endpoint's hostname is
+# not resolvable by cluster DNS but its IP is routable (e.g. an internal gateway
+# on a split-horizon DNS). Each entry: { ip: "10.0.0.1", hostnames: ["host"] }.
+hostAliases: []
 config:
   defaults:
     time_window_days: 14
