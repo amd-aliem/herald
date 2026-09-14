@@ -2,8 +2,9 @@
 
 This guide walks through deploying Herald as a scheduled `CronJob` with the Helm
 chart in `helm/herald/`, and covers the operational gotchas that aren't obvious
-from the chart alone. It assumes you've already published an image (see the
-README's "Publishing the image") and configured at least one team.
+from the chart alone. It assumes you've already published an image (see
+[Building & publishing the image](#building--publishing-the-image) below) and
+configured at least one team.
 
 ## Overview
 
@@ -31,6 +32,27 @@ about that second one, or about storage — see [Troubleshooting](#troubleshooti
 - Your team config(s) in `values.config` (or the chart's default example).
 - Credentials: an LLM API key, optionally a GitHub token, and — if posting — a
   webhook URL per team.
+
+## Building & publishing the image
+
+The `.github/workflows/publish-image.yml` workflow builds the image and pushes it
+to the GitHub Container Registry on version tags — no extra secrets needed (it
+uses the built-in `GITHUB_TOKEN`):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# -> ghcr.io/<owner>/herald:0.1.0, :0.1, :sha-<commit>, :latest
+```
+
+Make the package **public** (repo → Packages → package settings) so clusters can
+pull without an image pull secret. `values.yaml` defaults `image.repository` to
+this published image. To publish elsewhere, build and push manually:
+
+```bash
+docker build -t <registry>/herald:<tag> .
+docker push <registry>/herald:<tag>
+```
 
 ## Managing secrets
 

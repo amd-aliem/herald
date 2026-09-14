@@ -3,17 +3,23 @@
     {
       "type": "github",
       "repositories": [
-        "owner/repo"
-      ]
+        "owner/repo-1",
+        "owner/repo-2"
+      ],
+      "filters": {
+        "exclude_authors": ["dependabot[bot]"]
+      },
+      "diff_keywords": ["security", "breaking", "critical"],
+      "fetch_comments": true
     }
   ],
-  "team_context": {
-    "name": "My Team",
-    "focus_areas": [
-      "Your focus area"
-    ],
-    "priorities": [
-      "Your top priority"
-    ]
-  }
+  "display_name": "My Team",
+  "focus_areas": [
+    "A feature area your team cares about",
+    "Another relevant technology or domain"
+  ],
+  "priorities": [
+    "Your top priority (flagged as high priority in digests)",
+    "Secondary priority"
+  ]
 }
