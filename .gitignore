@@ -16,3 +16,10 @@ config/secrets/*.json
 !config/secrets/secrets.example.json
 groups/*.json
 !groups/example.json
+
+# Legacy top-level secrets dir (pre-migration); contains live webhook URLs
+secrets/
+
+# Helm: never commit values overrides with real secrets
+helm/**/values.local.yaml
+helm/**/*.secret.yaml

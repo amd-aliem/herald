@@ -6,14 +6,14 @@ on:
     - cron: '0 9 * * 1'
   workflow_dispatch:
     inputs:
+      team:
+        description: 'Team name to process (blank for all)'
+        required: false
+        default: ''
       days:
         description: 'Number of days to look back'
         required: false
         default: '14'
-      group:
-        description: 'Group name to process (blank for all)'
-        required: false
-        default: ''
       force:
         description: 'Force regenerate (ignore cache)'
         required: false
@@ -33,36 +33,35 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code
-
       - name: Generate digest
         env:
+          # Anthropic-compatible endpoint (api.anthropic.com or AMD-internal gateway).
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ARGS=""
+          ARGS="digest"
+          if [ -n "${{ inputs.team }}" ]; then
+            ARGS="$ARGS --team ${{ inputs.team }}"
+          fi
           if [ -n "${{ inputs.days }}" ] && [ "${{ inputs.days }}" != "14" ]; then
             ARGS="$ARGS --days ${{ inputs.days }}"
-          fi
-          if [ -n "${{ inputs.group }}" ]; then
-            ARGS="$ARGS --group ${{ inputs.group }}"
           fi
           if [ "${{ inputs.force }}" = "true" ]; then
             ARGS="$ARGS --force"
           fi
-          python herald.py $ARGS --output digest-output.md
+          python herald.py $ARGS
 
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
         with:
           name: herald-digest-${{ github.run_number }}
-          path: |
-            digest-output.md
-            reports/
+          path: reports/
           retention-days: 90

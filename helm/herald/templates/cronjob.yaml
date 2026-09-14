@@ -1,0 +1,105 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "herald.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "herald.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.cronjob.schedule | quote }}
+  concurrencyPolicy: {{ .Values.cronjob.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
+  {{- with .Values.cronjob.startingDeadlineSeconds }}
+  startingDeadlineSeconds: {{ . }}
+  {{- end }}
+  jobTemplate:
+    spec:
+      {{- with .Values.cronjob.activeDeadlineSeconds }}
+      activeDeadlineSeconds: {{ . }}
+      {{- end }}
+      backoffLimit: {{ .Values.cronjob.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "herald.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: herald
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                {{- toYaml .Values.cronjob.args | nindent 16 }}
+              env:
+                - name: HERALD_CONFIG
+                  value: /app/config/herald.json
+                - name: ANTHROPIC_BASE_URL
+                  value: {{ .Values.endpoint.baseUrl | quote }}
+                - name: ANTHROPIC_MODEL
+                  value: {{ .Values.endpoint.model | quote }}
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "herald.secretName" . }}
+                      key: ANTHROPIC_API_KEY
+                - name: ANTHROPIC_CUSTOM_HEADERS
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "herald.secretName" . }}
+                      key: ANTHROPIC_CUSTOM_HEADERS
+                      optional: true
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "herald.secretName" . }}
+                      key: GITHUB_TOKEN
+                      optional: true
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              volumeMounts:
+                - name: config
+                  mountPath: /app/config/herald.json
+                  subPath: herald.json
+                  readOnly: true
+                {{- if .Values.secrets.teamWebhooks }}
+                - name: secrets
+                  mountPath: /app/config/secrets
+                  readOnly: true
+                {{- end }}
+                - name: cache
+                  mountPath: /app/.cache
+                - name: reports
+                  mountPath: /app/reports
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+          volumes:
+            - name: config
+              configMap:
+                name: {{ include "herald.fullname" . }}-config
+            {{- if .Values.secrets.teamWebhooks }}
+            - name: secrets
+              secret:
+                secretName: {{ include "herald.secretName" . }}
+                items:
+                  {{- range $team, $url := .Values.secrets.teamWebhooks }}
+                  - key: {{ $team }}.json
+                    path: {{ $team }}.json
+                  {{- end }}
+            {{- end }}
+            - name: cache
+              {{- if .Values.cache.persistent }}
+              persistentVolumeClaim:
+                claimName: {{ include "herald.fullname" . }}-cache
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+            - name: reports
+              emptyDir: {}

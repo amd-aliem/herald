@@ -1,0 +1,15 @@
+.git/
+.github/
+.claude/
+.cache/
+reports/
+groups/
+helm/
+secrets/
+config/secrets/
+__pycache__/
+*.pyc
+*.md
+!requirements.txt
+PLAN-*.md
+skills/

@@ -2,7 +2,12 @@
   "defaults": {
     "time_window_days": 14,
     "max_commits": 20,
-    "activity_types": ["commits", "pulls", "issues", "releases"]
+    "activity_types": ["commits", "pulls", "issues", "releases"],
+    "ai_backend": {
+      "base_url": "https://api.anthropic.com",
+      "model": "Claude-Opus-4-8",
+      "timeout": 600
+    }
   },
   "teams": [
     {
@@ -20,17 +25,15 @@
           ]
         }
       ],
-      "team_context": {
-        "name": "My Other Team",
-        "focus_areas": [
-          "Feature area your team cares about",
-          "Another relevant technology or domain"
-        ],
-        "priorities": [
-          "Your team's top priority (shown first in AI summaries)",
-          "Secondary priority"
-        ]
-      }
+      "display_name": "My Other Team",
+      "focus_areas": [
+        "Feature area your team cares about",
+        "Another relevant technology or domain"
+      ],
+      "priorities": [
+        "Your team's top priority (shown first in AI summaries)",
+        "Secondary priority"
+      ]
     }
   ]
 }

@@ -1,0 +1,108 @@
+# Herald Helm chart values.
+#
+# Quick start (POC):
+#   helm install herald ./helm/herald \
+#     --set secrets.anthropicApiKey=$ANTHROPIC_API_KEY \
+#     --set secrets.githubToken=$GITHUB_TOKEN \
+#     --set-string secrets.teamWebhooks.my-team=$WEBHOOK_URL
+#
+# The `config:` block below is a generic single-team example. Supply your real
+# teams, endpoint, and secrets at install time via an untracked overlay:
+#   helm install herald ./helm/herald -f helm/herald/values.local.yaml
+# (values.local.yaml is gitignored.) In production, prefer secrets.existingSecret
+# and manage the Secret out of band.
+
+image:
+  repository: herald
+  tag: poc
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ''
+fullnameOverride: ''
+endpoint:
+  baseUrl: https://api.anthropic.com
+  model: claude-opus-4-8
+secrets:
+  existingSecret: ''
+  anthropicApiKey: ''
+  # For a gateway needing custom auth headers, set as "Key: Value" (one per line).
+  anthropicCustomHeaders: ''
+  githubToken: ''
+  teamWebhooks: {}
+cronjob:
+  schedule: 0 9 * * 1
+  args:
+  - digest
+  - --team
+  - my-team
+  concurrencyPolicy: Forbid
+  backoffLimit: 1
+  activeDeadlineSeconds: 3600
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+cache:
+  persistent: true
+  size: 5Gi
+  storageClass: ''
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: '1'
+    memory: 2Gi
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+extraEnv: []
+config:
+  defaults:
+    time_window_days: 14
+    max_commits: 20
+    activity_types:
+    - commits
+    - pulls
+    - issues
+    - releases
+    ai_backend:
+      timeout: 600
+  teams:
+  - sources:
+    - type: github
+      repositories:
+      - owner/repo-1
+      - owner/repo-2
+      filters:
+        exclude_authors:
+        - dependabot[bot]
+        exclude_titles: []
+        exclude_labels: []
+      diff_keywords:
+      - security
+      - breaking
+      - critical
+      max_diff_size: 50000
+      fetch_comments: true
+      max_comments_per_item: 5
+      deep_analysis:
+        enabled: true
+        clone_dir: .cache/repos
+        context_files:
+        - CLAUDE.md
+        - README.md
+        - README.rst
+        - ARCHITECTURE.md
+        - CONTRIBUTING.md
+        - docs/architecture.md
+        max_file_size: 50000
+    display_name: My Team
+    focus_areas:
+    - Feature area your team cares about
+    - Another relevant technology or domain
+    priorities:
+    - Your team's top priority (flagged in digests)
+    - Secondary priority
+    sub_teams: []
+    name: my-team

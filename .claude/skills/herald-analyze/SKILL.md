@@ -19,7 +19,7 @@ A JSON file with `{ "meta": { team, team_context, time_window_days, since, ... }
 2. Extract `meta.team_context` (name, focus_areas, priorities) and `activity` array.
 3. **Triage repos** — Sort repos by combined relevance: sum of `_herald_relevance.score` across PRs, then by total item count. Drop repos with zero meaningful activity (only bot commits, no PRs/issues/releases). Use `meta.stats` for quick counts.
 4. For each kept repository, summarize commits, PRs, issues, and releases. Commits that duplicate PR merge/head SHAs are already removed by `herald.py fetch`.
-   - **PRs with `_herald_relevance`**: include `[RELEVANCE: N]` and weave the reason into the summary sentence. Lead with score 4-5 items.
+   - **PRs with `_herald_relevance`**: use the score to order and prioritize (lead with score 4-5 items) and weave the reason into the summary sentence, but do **not** print the numeric score. Never emit a `[RELEVANCE: N]` tag.
    - **PRs with `_herald_diff`**: reference key changed files or subsystems; don't paste raw diff.
    - **`_herald_comments`**: surface review blockers or contentious discussion in the summary sentence. Don't list comments individually.
    - **`_herald_repo_context`**: use project docs (README, ARCHITECTURE) to explain *why* a change matters in context.

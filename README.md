@@ -1,26 +1,40 @@
 # Herald
 
-Herald fetches GitHub repository activity and produces team-focused digests. The data pipeline lives in Python; AI analysis lives in Claude Code skills.
+Herald fetches GitHub repository activity and produces team-focused digests. The
+data pipeline lives in Python. There are **two ways to run the AI step**:
 
-## Quick Start
+1. **Headless (`herald.py digest`)** — calls the Anthropic Messages API directly.
+   No Node or Claude Code required. This is what the container and CI use.
+2. **Interactive (Claude Code skills)** under `.claude/skills/` — for local,
+   exploratory runs.
+
+## Quick Start (headless)
 
 ```bash
 # 1. Install
 pip install -r requirements.txt
 export GITHUB_TOKEN=ghp_...  # optional but recommended (5000 vs 60 req/hour)
 
-# 2. Configure (interactive)
-/herald-config               # inside Claude Code
+# 2. Point Herald at the Anthropic API
+export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_MODEL=claude-opus-4-8
+# Optional: route through a proxy or corporate LLM gateway instead
+# export ANTHROPIC_BASE_URL=https://your-gateway.example.com/anthropic
+# export ANTHROPIC_CUSTOM_HEADERS="X-Auth-Header: <value>"
 
-# 3. Generate a digest
-/herald-digest my-team
+# 3. Configure a team (see Configuration below) then generate a digest
+python herald.py digest --team my-team
+python herald.py digest --team my-team --days 30 --post   # deliver to Teams
 ```
 
-Or manually:
+## Quick Start (Claude Code)
 
 ```bash
-python herald.py fetch --team my-team -o activity.json
-# then use /herald-analyze with the JSON, or pipe through your own tooling
+pip install -r requirements.txt
+export GITHUB_TOKEN=ghp_...
+
+/herald-config               # inside Claude Code — interactive team setup
+/herald-digest my-team       # full run: fetch, rate PRs, analyze, save report
 ```
 
 ## CLI Reference
@@ -45,6 +59,27 @@ python herald.py fetch --repos owner/repo1,owner/repo2
 python herald.py fetch -t team-a -t team-b
 ```
 
+### digest
+
+Full headless pipeline: fetch activity, rate PRs for relevance, and generate a
+markdown digest by calling the Anthropic Messages API directly (no Claude Code).
+Requires an LLM endpoint configured via the `ANTHROPIC_*` environment variables
+(see [LLM Endpoint](#llm-endpoint-for-digest)).
+
+```bash
+# Digest one team → reports/<team>/herald-digest-<date>.md
+python herald.py digest --team my-team
+
+# Widen the window, bypass cache, write to a specific file
+python herald.py digest -t my-team --days 30 --force -o digest.md
+
+# Generate and post to Teams (webhook resolved from secrets)
+python herald.py digest -t my-team --post
+
+# All configured teams (omit --team)
+python herald.py digest
+```
+
 ### list-teams
 
 ```bash
@@ -67,6 +102,47 @@ Post a digest to Microsoft Teams via Power Automate webhook. Reads markdown from
 python herald.py post --team my-team < reports/my-team/herald-digest-2026-06-24.md
 python herald.py post --webhook-url "$URL" < digest.md
 ```
+
+## LLM Endpoint (for `digest`)
+
+The `digest` command talks to any Anthropic-compatible `/v1/messages` endpoint —
+`api.anthropic.com` by default, or a proxy/corporate gateway. Settings come from
+the environment (override) or a `defaults.ai_backend` block in config, with
+environment variables taking precedence so the same image runs unchanged across
+environments.
+
+| Variable | Config key | Effect |
+|----------|------------|--------|
+| `ANTHROPIC_API_KEY` | `ai_backend.api_key` | API key (required) |
+| `ANTHROPIC_MODEL` | `ai_backend.model` | Model id, e.g. `claude-opus-4-8` |
+| `ANTHROPIC_BASE_URL` | `ai_backend.base_url` | Endpoint base (default `https://api.anthropic.com`) |
+| `ANTHROPIC_CUSTOM_HEADERS` | `ai_backend.headers` | Extra headers as `Key: Value` lines (one per line), for gateways that need custom auth |
+
+Behind a corporate LLM gateway? See your internal setup notes for the base URL,
+model id, and any custom auth header.
+
+The `digest` command ports the `herald-rate-pr` and `herald-analyze` skill
+prompts into Python, so headless and interactive runs produce comparable output.
+
+## Container & Kubernetes
+
+Herald ships a `python:3.12-slim` image and a Helm chart that runs `herald.py
+digest` on a schedule.
+
+```bash
+docker build -t herald:poc .
+
+helm install herald ./helm/herald \
+  --set secrets.anthropicApiKey=$ANTHROPIC_API_KEY \
+  --set secrets.githubToken=$GITHUB_TOKEN \
+  --set-string secrets.teamWebhooks.my-team=$WEBHOOK_URL
+# Behind a gateway, also: --set secrets.anthropicCustomHeaders="X-Auth-Header: <value>"
+```
+
+Team config lives in the chart's **ConfigMap** (`values.config`); API keys and
+per-team webhooks live in the **Secret**. The endpoint base URL and model are set
+under `endpoint:` in `values.yaml`. The CronJob's `cronjob.args` selects which
+team(s) to digest.
 
 ## Skills (Claude Code)
 
@@ -168,6 +244,7 @@ Teams can reference external files (`config_file`) or be defined inline with `so
 | `HERALD_DAYS` | Override `time_window_days` |
 | `HERALD_MAX_COMMITS` | Override `max_commits` |
 | `HERALD_TEAMS_WEBHOOK` | Fallback webhook URL for all teams |
+| `ANTHROPIC_*` | LLM endpoint for `digest` — see [LLM Endpoint](#llm-endpoint-for-digest) |
 
 ## Activity JSON Schema
 

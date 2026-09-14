@@ -1166,8 +1166,13 @@ class Herald:
     def fetch_teams(self, team_names: Optional[List[str]] = None,
                     repositories: Optional[List[str]] = None,
                     time_window_days: Optional[int] = None,
-                    output_path: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch activity for one or more teams and return JSON envelopes."""
+                    output_path: Optional[str] = None,
+                    emit: bool = True) -> List[Dict[str, Any]]:
+        """Fetch activity for one or more teams and return JSON envelopes.
+
+        When ``emit`` is False, envelopes are returned without writing files or
+        printing to stdout (used by the in-process ``digest`` pipeline).
+        """
         teams = self._resolve_teams_to_process(team_names, repositories)
         if not teams:
             logger.error("No teams to process.")
@@ -1177,6 +1182,9 @@ class Herald:
         for team in teams:
             activity, days, since = self.fetch_team_activity(team, time_window_days)
             envelopes.append(self.serialize_activity(team, activity, days, since))
+
+        if not emit:
+            return envelopes
 
         if len(teams) == 1:
             payload = envelopes[0]
@@ -1198,6 +1206,24 @@ class Herald:
             logger.info("Wrote activity JSON: %s", path)
 
         return envelopes
+
+    def resolve_webhook(self, team_name: Optional[str] = None,
+                        explicit_url: Optional[str] = None) -> Optional[str]:
+        """Resolve a Teams webhook URL (explicit > env > team secrets file)."""
+        if explicit_url:
+            return explicit_url
+        env_webhook = os.environ.get("HERALD_TEAMS_WEBHOOK")
+        if env_webhook:
+            return env_webhook
+        if team_name:
+            secrets_path = self.config_dir / "secrets" / f"{team_name}.json"
+            if secrets_path.exists():
+                try:
+                    with open(secrets_path) as f:
+                        return json.load(f).get("teams_webhook_url")
+                except Exception as e:
+                    logger.error("Failed to read secrets from %s: %s", secrets_path, e)
+        return None
 
     def list_teams(self):
         """Print configured teams and exit."""
@@ -1290,7 +1316,9 @@ def markdown_to_adaptive_card_blocks(markdown_text: str) -> List[Dict]:
             continue  # skip raw separators
         else:
             if stripped.startswith('*Team:') or stripped.startswith('_Team:'):
-                subtitle_text = stripped
+                # Strip the surrounding markdown emphasis; Adaptive Card
+                # TextBlock renders '*'/'_' literally rather than as italics.
+                subtitle_text = stripped.strip('*_').strip()
             elif current_heading is not None:
                 current_body.append(stripped)
             else:
@@ -1527,6 +1555,441 @@ def post_digest_to_teams(digest_output: str, webhook_url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# LLM client — direct Anthropic Messages API (AMD-internal endpoint compatible)
+# ---------------------------------------------------------------------------
+
+class LLMError(Exception):
+    """Raised when an LLM request fails."""
+
+
+class AnthropicClient:
+    """Minimal client for the Anthropic Messages API.
+
+    Talks directly to any Anthropic-compatible ``/v1/messages`` endpoint, so it
+    works against api.anthropic.com or a proxy/corporate LLM gateway. All
+    connection settings are taken from an ``ai_backend`` config block, with
+    environment variables taking precedence so the same image runs unchanged
+    across environments.
+
+    Resolution order (env overrides config):
+      - base_url:  ANTHROPIC_BASE_URL   | ai_backend.base_url
+      - api_key:   ANTHROPIC_API_KEY    | ai_backend.api_key
+      - model:     ANTHROPIC_MODEL      | ai_backend.model
+      - headers:   ANTHROPIC_CUSTOM_HEADERS (a "Key: Value" string, one per
+                   line) merged over ai_backend.headers (a dict)
+    """
+
+    DEFAULT_BASE_URL = "https://api.anthropic.com"
+    ANTHROPIC_VERSION = "2023-06-01"
+
+    def __init__(self, backend: Optional[Dict[str, Any]] = None):
+        backend = backend or {}
+
+        self.base_url = (os.environ.get("ANTHROPIC_BASE_URL")
+                         or backend.get("base_url")
+                         or self.DEFAULT_BASE_URL).rstrip("/")
+        self.api_key = os.environ.get("ANTHROPIC_API_KEY") or backend.get("api_key", "")
+        self.model = (os.environ.get("ANTHROPIC_MODEL")
+                      or backend.get("model")
+                      or "Claude-Sonnet-4-5")
+        self.timeout = int(backend.get("timeout", 600))
+        self.max_tokens = int(backend.get("max_tokens", 4096))
+
+        # Extra headers: config dict first, then ANTHROPIC_CUSTOM_HEADERS on top.
+        self.extra_headers: Dict[str, str] = {}
+        cfg_headers = backend.get("headers", {})
+        if isinstance(cfg_headers, dict):
+            for k, v in cfg_headers.items():
+                self.extra_headers[str(k)] = str(v)
+        self.extra_headers.update(self._parse_custom_headers(
+            os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")))
+
+    @staticmethod
+    def _parse_custom_headers(raw: str) -> Dict[str, str]:
+        """Parse a 'Key: Value' string (one header per line) into a dict."""
+        headers: Dict[str, str] = {}
+        for line in raw.replace("\\n", "\n").split("\n"):
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            headers[key.strip()] = value.strip()
+        return headers
+
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
+
+    def complete(self, system: str, user: str,
+                 max_tokens: Optional[int] = None) -> str:
+        """Send a single-turn message and return the concatenated text output."""
+        if not self.api_key:
+            raise LLMError("No API key. Set ANTHROPIC_API_KEY or ai_backend.api_key.")
+
+        url = f"{self.base_url}/v1/messages"
+        headers = {
+            "content-type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": self.ANTHROPIC_VERSION,
+        }
+        headers.update(self.extra_headers)
+
+        payload = {
+            "model": self.model,
+            "max_tokens": max_tokens or self.max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=payload,
+                                     timeout=self.timeout)
+        except requests.exceptions.RequestException as e:
+            raise LLMError(f"Request to {url} failed: {e}") from e
+
+        if response.status_code != 200:
+            raise LLMError(f"HTTP {response.status_code} from {url}: "
+                           f"{response.text[:500]}")
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise LLMError(f"Invalid JSON response from {url}: {e}") from e
+
+        parts = [block.get("text", "")
+                 for block in data.get("content", [])
+                 if block.get("type") == "text"]
+        text = "".join(parts).strip()
+        if not text:
+            raise LLMError(f"Empty response from {url}: {json.dumps(data)[:300]}")
+        return text
+
+
+# ---------------------------------------------------------------------------
+# Digest generation — ports the herald-rate-pr and herald-analyze skills
+# ---------------------------------------------------------------------------
+
+# System prompt ported verbatim in intent from .claude/skills/herald-rate-pr.
+RATE_PR_SYSTEM_PROMPT = """\
+You rate how relevant a single GitHub pull request is to a team's focus areas \
+and priorities, on a 1-5 scale.
+
+You receive JSON with:
+- pr — PR object (title, body, user, state, _herald_diff, _herald_diff_type)
+- repo — repository name (owner/repo)
+- team_context — { name, focus_areas, priorities }
+
+Evaluate relevance using these signals, in priority order:
+1. Priorities match — Does the PR touch team_context.priorities? A match with
+   priorities[0] pushes toward 5.
+2. Focus areas match — Check title, body, and diff file paths against each
+   focus_areas entry.
+3. Diff content — If _herald_diff is present, scan changed file paths and code
+   for team-relevant subsystems.
+4. Title/body keywords — Terms that align with the team's domain.
+
+When _herald_diff is absent or _herald_diff_type is "truncated", rate on
+title/body/file summary only; do not penalize for missing diff data.
+Rate from the team's perspective, not general importance. A critical kernel fix
+is a 2 for a networking team if it doesn't touch networking.
+
+Scale:
+5 = critical — Directly impacts the team's top priority; requires attention
+4 = relevant — Clearly within focus areas; team should be aware
+3 = somewhat relevant — Touches adjacent areas; useful context
+2 = tangential — Loosely related; skim-worthy at best
+1 = unrelated — No connection to team focus
+
+Respond with EXACTLY two lines and nothing else:
+RELEVANCE: <1-5>
+REASON: <one sentence>"""
+
+# System prompt ported verbatim in intent from .claude/skills/herald-analyze.
+ANALYZE_SYSTEM_PROMPT = """\
+You read a Herald activity JSON envelope and produce a team digest in markdown.
+
+Procedure:
+1. Extract meta.team_context (name, focus_areas, priorities) and the activity
+   array.
+2. Triage repos — Sort by combined relevance: sum of _herald_relevance.score
+   across PRs, then total item count. Drop repos with zero meaningful activity
+   (only bot commits, no PRs/issues/releases).
+3. For each kept repo, summarize commits, PRs, issues, releases. Commits that
+   duplicate PR merge/head SHAs are already removed.
+   - PRs with _herald_relevance: use the score to order and prioritize (lead
+     with score 4-5 items) and weave the reason into the summary, but do NOT
+     print the numeric score. Never emit a "[RELEVANCE: N]" tag.
+   - PRs with _herald_diff: reference key changed files/subsystems; never paste
+     raw diff.
+   - _herald_comments: surface review blockers or contention in the sentence.
+   - _herald_repo_context: use project docs to explain why a change matters.
+   - Standalone commits: group minor ones into "N other commits". Give
+     individual bullets only to notable standalone commits.
+4. Cap at ~8 bullets per repo. Combine related issues/PRs where possible.
+5. Repos with only 1-2 minor items: fold into a "Minor activity" section.
+
+Output format:
+
+**TL;DR:** <2-3 sentences leading with items matching priorities[0], then key themes>
+
+### owner/repo
+- [HIGH PRIORITY] **Title** [STATUS] ([#N](url)) PR by @author — What changed and why it matters
+- **Title** [STATUS] ([#N](url)) PR by @author — What changed and why it matters
+- **Title** [STATUS] ([#N](url)) Issue — What the issue reports
+- **Title** [STATUS] ([#N](url), +N more) Summary — Grouped description
+- **Title** [RELEASED] ([vX.Y.Z](url)) Release
+- **Title** Commit (abc1234) — What the commit does
+- N other commits including X, Y, and Z.
+
+### Minor activity
+- **owner/repo**: brief note
+
+### Recommended Actions
+- **Action title** — Recommendation with relevant links
+
+Format rules:
+- [STATUS] values (square brackets required): [MERGED], [OPEN], [CLOSED], [RELEASED]
+- Item type label required after the link/status: PR, Issue, Summary, Release,
+  Commit, or Commits.
+  - PRs: [STATUS] ([#N](url)) PR by @author
+  - Issues: [STATUS] ([#N](url)) Issue
+  - Grouped: [STATUS] ([#N](url), +N more) Summary
+  - Releases: [RELEASED] ([tag](url)) Release
+  - Commits: Commit (sha) or Commits (sha, sha)
+- "by @author" required for PRs; omit for issues, summaries, releases, commits.
+- Start directly with **TL;DR:** — no preamble, heading, or sign-off.
+- ### headings for each active repo and Recommended Actions.
+- Items matching team_context.priorities[0] go first in their repo section,
+  tagged [HIGH PRIORITY]. This tag conveys importance; do not add relevance
+  scores. Never emit "[RELEVANCE: N]" anywhere in the output.
+- Em dash ( — ) separating type/attribution from context sentence is required.
+- 1-3 recommended actions; fewer is fine. Be specific, not generic.
+
+Output only the digest markdown. No preamble or commentary."""
+
+
+def _parse_relevance(text: str) -> Optional[Dict[str, Any]]:
+    """Parse a RELEVANCE/REASON response into a relevance dict."""
+    score_match = re.search(r'RELEVANCE:\s*([1-5])', text)
+    reason_match = re.search(r'REASON:\s*(.+)', text)
+    if not score_match:
+        return None
+    return {
+        "score": int(score_match.group(1)),
+        "reason": reason_match.group(1).strip() if reason_match else "",
+    }
+
+
+def rate_prs(client: AnthropicClient, envelope: Dict[str, Any]) -> Tuple[int, int]:
+    """Rate every PR with a diff that isn't already rated. Mutates envelope.
+
+    Returns (rated, skipped).
+    """
+    meta = envelope.get("meta", {})
+    team_context = meta.get("team_context", {})
+    rated = 0
+    skipped = 0
+
+    for repo_activity in envelope.get("activity", []):
+        repo = repo_activity.get("repository", "unknown")
+        for pr in repo_activity.get("pulls", []):
+            if "_herald_diff" not in pr:
+                continue
+            if "_herald_relevance" in pr:
+                skipped += 1
+                continue
+
+            pr_input = json.dumps({
+                "pr": {k: v for k, v in pr.items()
+                       if k in ("number", "title", "body", "state", "merged_at",
+                                "user", "_herald_diff", "_herald_diff_type",
+                                "_herald_comments")},
+                "repo": repo,
+                "team_context": team_context,
+            }, indent=2)
+
+            try:
+                response = client.complete(RATE_PR_SYSTEM_PROMPT, pr_input,
+                                           max_tokens=200)
+                relevance = _parse_relevance(response)
+            except LLMError as e:
+                logger.warning("  Rating PR %s#%s failed: %s",
+                               repo, pr.get("number"), e)
+                continue
+
+            if relevance is None:
+                logger.warning("  Could not parse rating for %s#%s",
+                               repo, pr.get("number"))
+                continue
+
+            pr["_herald_relevance"] = relevance
+            rated += 1
+
+    return rated, skipped
+
+
+def _truncate(value: Any, limit: int) -> Any:
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + "\n... [truncated]"
+    return value
+
+
+# Per-repo caps on items sent to the analyze prompt. Raw GitHub objects are huge
+# and unbounded (a busy repo can return hundreds of PRs), so we slim each item to
+# the fields the digest actually uses and cap counts to stay within the LLM's
+# context window.
+MAX_PRS_PER_REPO = 40
+MAX_ISSUES_PER_REPO = 25
+MAX_COMMITS_PER_REPO = 30
+MAX_RELEASES_PER_REPO = 10
+
+
+def _slim_pr(pr: Dict[str, Any]) -> Dict[str, Any]:
+    slim = {
+        "number": pr.get("number"),
+        "title": pr.get("title"),
+        "state": _get_pr_state(pr),
+        "author": (pr.get("user") or {}).get("login", ""),
+        "url": pr.get("html_url"),
+        "body": _truncate(pr.get("body") or "", 600),
+    }
+    if "_herald_relevance" in pr:
+        slim["_herald_relevance"] = pr["_herald_relevance"]
+    if "_herald_diff" in pr:
+        slim["_herald_diff"] = _truncate(pr["_herald_diff"], 3000)
+        slim["_herald_diff_type"] = pr.get("_herald_diff_type")
+    if "_herald_comments" in pr:
+        slim["_herald_comments"] = pr["_herald_comments"]
+    return slim
+
+
+def _slim_issue(issue: Dict[str, Any]) -> Dict[str, Any]:
+    slim = {
+        "number": issue.get("number"),
+        "title": issue.get("title"),
+        "state": issue.get("state"),
+        "author": (issue.get("user") or {}).get("login", ""),
+        "url": issue.get("html_url"),
+        "body": _truncate(issue.get("body") or "", 400),
+        "labels": [lbl.get("name", "") for lbl in issue.get("labels", [])],
+    }
+    if "_herald_comments" in issue:
+        slim["_herald_comments"] = issue["_herald_comments"]
+    return slim
+
+
+def _slim_commit(commit: Dict[str, Any]) -> Dict[str, Any]:
+    sha = commit.get("sha", "")
+    return {
+        "sha": sha[:7],
+        "message": (commit.get("commit", {}).get("message", "") or "").split("\n")[0],
+        "author": commit.get("commit", {}).get("author", {}).get("name", ""),
+        "url": commit.get("html_url"),
+    }
+
+
+def _slim_release(release: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "tag": release.get("tag_name"),
+        "name": release.get("name"),
+        "url": release.get("html_url"),
+        "published_at": release.get("published_at"),
+    }
+
+
+def _pr_sort_key(pr: Dict[str, Any]) -> Tuple[int, str]:
+    score = (pr.get("_herald_relevance") or {}).get("score", 0)
+    return (score, pr.get("updated_at", ""))
+
+
+def _compact_activity(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a slim, capped copy of the activity for the analyze prompt.
+
+    Extracts only the fields the digest uses and caps items per repo so the
+    prompt fits the LLM context window regardless of how busy a repo is.
+    """
+    compact: Dict[str, Any] = {"meta": envelope.get("meta", {}), "activity": []}
+
+    for repo_activity in envelope.get("activity", []):
+        pulls = sorted(repo_activity.get("pulls", []),
+                       key=_pr_sort_key, reverse=True)[:MAX_PRS_PER_REPO]
+        issues = repo_activity.get("issues", [])[:MAX_ISSUES_PER_REPO]
+        commits = repo_activity.get("commits", [])[:MAX_COMMITS_PER_REPO]
+        releases = repo_activity.get("releases", [])[:MAX_RELEASES_PER_REPO]
+
+        slim_repo: Dict[str, Any] = {
+            "repository": repo_activity.get("repository"),
+            "counts": {
+                "pulls": len(repo_activity.get("pulls", [])),
+                "issues": len(repo_activity.get("issues", [])),
+                "commits": len(repo_activity.get("commits", [])),
+                "releases": len(repo_activity.get("releases", [])),
+            },
+            "pulls": [_slim_pr(p) for p in pulls],
+            "issues": [_slim_issue(i) for i in issues],
+            "commits": [_slim_commit(c) for c in commits],
+            "releases": [_slim_release(r) for r in releases],
+        }
+
+        ctx = repo_activity.get("_herald_repo_context")
+        if isinstance(ctx, dict):
+            slim_repo["_herald_repo_context"] = {
+                k: _truncate(v, 1500) for k, v in ctx.items()
+            }
+
+        compact["activity"].append(slim_repo)
+
+    return compact
+
+
+def generate_digest(client: AnthropicClient, envelope: Dict[str, Any]) -> str:
+    """Produce digest markdown from a rated activity envelope."""
+    compact = _compact_activity(envelope)
+    user = json.dumps(compact, indent=2)
+    return client.complete(ANALYZE_SYSTEM_PROMPT, user, max_tokens=8192)
+
+
+def _format_date_range(since_iso: str, days: Optional[int]) -> str:
+    """Render a 'Aug 31 – Sep 14, 2026 (N days)' range from the meta fields.
+
+    Falls back gracefully if ``since`` is missing or unparseable.
+    """
+    end = datetime.now()
+    start = None
+    if since_iso:
+        try:
+            start = date_parser.parse(since_iso)
+        except (ValueError, TypeError):
+            start = None
+
+    suffix = f" ({days} days)" if days else ""
+    if start is None:
+        return f"through {end.strftime('%b %-d, %Y')}{suffix}"
+
+    # Omit the year on the start date when both ends share it.
+    start_fmt = "%b %-d" if start.year == end.year else "%b %-d, %Y"
+    return (f"{start.strftime(start_fmt)} – "
+            f"{end.strftime('%b %-d, %Y')}{suffix}")
+
+
+def prepend_digest_header(digest_md: str, envelope: Dict[str, Any]) -> str:
+    """Prepend a deterministic title + team/date subtitle to digest markdown.
+
+    Herald knows the team name and date window from the envelope meta, so the
+    header is generated in code rather than asked of the LLM. The Teams card
+    builder reads the ``# `` title and ``*Team:`` subtitle to render its header.
+    """
+    meta = envelope.get("meta", {})
+    team_context = meta.get("team_context", {})
+    name = team_context.get("name") or meta.get("team", "Activity")
+    date_range = _format_date_range(meta.get("since", ""),
+                                    meta.get("time_window_days"))
+
+    title = f"# {name} — Activity Digest"
+    subtitle = f"*Team: {name} | {date_range}*"
+    return f"{title}\n{subtitle}\n\n{digest_md.lstrip()}"
+
+
+# ---------------------------------------------------------------------------
 # Config migration
 # ---------------------------------------------------------------------------
 
@@ -1686,6 +2149,29 @@ def main():
     post_parser.add_argument('--team', '-t', help='Team name (loads webhook from secrets)')
     post_parser.add_argument('--webhook-url', help='Power Automate webhook URL')
 
+    digest_parser = subparsers.add_parser(
+        "digest", help="Fetch, rate PRs, and generate a digest via the LLM API",
+        description="Full pipeline: fetch activity, rate PRs for relevance, and\n"
+                    "generate a markdown digest by calling the Anthropic Messages\n"
+                    "API directly (no Claude Code required). Configure the endpoint\n"
+                    "with ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, ANTHROPIC_MODEL,\n"
+                    "and ANTHROPIC_CUSTOM_HEADERS, or an ai_backend config block.",
+        epilog="Examples:\n"
+               "  python herald.py digest --team my-team\n"
+               "  python herald.py digest -t my-team --days 7 --force -o digest.md\n"
+               "  python herald.py digest -t my-team --post\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common_args(digest_parser)
+    digest_parser.add_argument('--team', '-t', action='append',
+                               help='Team name (repeatable; default: all teams)')
+    digest_parser.add_argument('--days', type=int, help='Number of days to look back')
+    digest_parser.add_argument('--output', '-o',
+                               help='Output digest file (default: reports/<team>/'
+                                    'herald-digest-<date>.md)')
+    digest_parser.add_argument('--post', action='store_true',
+                               help='Post the digest to Teams after generating it')
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -1721,9 +2207,12 @@ def main():
         if not digest.strip():
             logger.error("No digest content on stdin")
             sys.exit(1)
-        if not digest.lstrip().startswith("**TL;DR:**"):
-            logger.warning("Digest does not start with '**TL;DR:**' — "
-                           "this may not be a Herald digest")
+        # A Herald digest starts either with the generated "# ... Activity
+        # Digest" header or directly with the TL;DR paragraph.
+        _head = digest.lstrip()
+        if not (_head.startswith("**TL;DR:**") or _head.startswith("# ")):
+            logger.warning("Digest does not look like a Herald digest "
+                           "(no title or '**TL;DR:**' at the start)")
         webhook = args.webhook_url or os.environ.get("HERALD_TEAMS_WEBHOOK")
         if not webhook and args.team:
             secrets_path = herald.config_dir / "secrets" / f"{args.team}.json"
@@ -1737,6 +2226,61 @@ def main():
             logger.error("No webhook URL. Use --webhook-url, --team, or HERALD_TEAMS_WEBHOOK")
             sys.exit(1)
         sys.exit(0 if post_digest_to_teams(digest, webhook) else 1)
+
+    if args.command == "digest":
+        backend = herald.get_defaults().get("ai_backend", {})
+        client = AnthropicClient(backend)
+        if not client.is_configured():
+            logger.error("No API key. Set ANTHROPIC_API_KEY or ai_backend.api_key "
+                         "in config.")
+            sys.exit(1)
+        logger.info("LLM: %s @ %s", client.model, client.base_url)
+
+        envelopes = herald.fetch_teams(team_names=args.team,
+                                       time_window_days=args.days, emit=False)
+        exit_code = 0
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        for envelope in envelopes:
+            team_name = envelope["meta"]["team"]
+            stats = envelope["meta"].get("stats", {})
+            if not envelope.get("activity"):
+                logger.warning("No activity for '%s'; skipping digest.", team_name)
+                continue
+            logger.info("Team '%s': %d repos, %d PRs, %d commits",
+                        team_name, stats.get("repos", 0),
+                        stats.get("pulls", 0), stats.get("commits", 0))
+
+            rated, skipped = rate_prs(client, envelope)
+            logger.info("  Rated %d PRs (skipped %d already-rated)", rated, skipped)
+
+            try:
+                digest_md = generate_digest(client, envelope)
+            except LLMError as e:
+                logger.error("  Digest generation failed for '%s': %s", team_name, e)
+                exit_code = 1
+                continue
+
+            digest_md = prepend_digest_header(digest_md, envelope)
+
+            if args.output and len(envelopes) == 1:
+                out_path = Path(args.output)
+            else:
+                out_path = (herald.config_dir.parent / "reports" / team_name
+                            / f"herald-digest-{today}.md")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(digest_md + "\n", encoding="utf-8")
+            logger.info("  Digest saved to %s", out_path)
+
+            if args.post:
+                webhook = herald.resolve_webhook(team_name=team_name)
+                if not webhook:
+                    logger.error("  --post requested but no webhook for '%s'", team_name)
+                    exit_code = 1
+                elif not post_digest_to_teams(digest_md, webhook):
+                    exit_code = 1
+
+        sys.exit(exit_code)
 
 
 
