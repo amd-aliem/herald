@@ -1013,6 +1013,15 @@ class Herald:
             issues += 1
 
 
+        # LLM endpoint — resolved exactly as `digest` will (env over ai_backend).
+        client = AnthropicClient(self.get_defaults().get("ai_backend", {}))
+        if client.is_configured():
+            print(f"OK: LLM endpoint configured ({client.model} @ {client.base_url})")
+        else:
+            print("FAIL: No LLM API key. Set ANTHROPIC_API_KEY (or ai_backend.api_key) "
+                  "for `digest`.")
+            valid = False
+
         if os.environ.get('GITHUB_TOKEN'):
             print("OK: GITHUB_TOKEN is set (5000 requests/hour)")
         else:
